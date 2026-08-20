@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import math
 import secrets
 import signal
 import socket
@@ -430,8 +431,15 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             proxy_failures = 0
             terminal = status.get("terminal")
             if terminal:
-                return ("draw", terminal, f"proxy reports {terminal}",
-                        round(now - start, 1), last_state)
+                # The proxy knows a bank emptied the moment a completion
+                # returns - BEFORE the agent has committed that move at the
+                # barrier and run the command, which might be the kill. Wait
+                # until both agents have actually stopped acting.
+                still_acting = [n for n in containers
+                                if not (last_state.get(n) or {}).get("stop_reason")]
+                if not still_acting:
+                    return ("draw", terminal, f"proxy reports {terminal}",
+                            round(now - start, 1), last_state)
 
         time.sleep(max(0.0, poll_interval - (time.time() - loop_start)))
 
@@ -457,13 +465,26 @@ def collect_logs(containers, match_dir, roles):
             target.write_text(res.stdout)
 
 
-def summarize_usage(match_dir):
-    """Aggregate per-agent token usage from the proxy log so a match records
-    what it actually cost."""
+def _percentile(values, fraction):
+    """Nearest-rank percentile. int(fraction * n) is a 0-indexed lookup against a
+    1-indexed rank, which returns the (floor(n/2)+1)-th value rather than the
+    median."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(fraction * len(ordered)) - 1)
+    return round(ordered[min(index, len(ordered) - 1)], 3)
+
+
+def summarize_proxy_log(match_dir):
+    """Aggregate per-agent cost AND per-move inference time from the proxy log.
+
+    The proxy is the only clock an agent cannot reach, so this is the
+    authoritative record of how long each model actually thought."""
     path = match_dir / "proxy" / "proxy.jsonl"
-    totals = {}
+    usage, moves = {}, {}
     if not path.exists():
-        return totals
+        return usage, {}
     for line in path.read_text(errors="replace").splitlines():
         try:
             rec = json.loads(line)
@@ -472,13 +493,25 @@ def summarize_usage(match_dir):
         if rec.get("event") != "completion":
             continue
         agent = rec.get("agent", "unknown")
-        entry = totals.setdefault(agent, {"requests": 0, "prompt_tokens": 0,
-                                          "completion_tokens": 0, "total_tokens": 0})
+        entry = usage.setdefault(agent, {"requests": 0, "prompt_tokens": 0,
+                                         "completion_tokens": 0, "total_tokens": 0})
         entry["requests"] += 1
-        usage = rec.get("usage") or {}
+        used = rec.get("usage") or {}
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            entry[key] += int(usage.get(key) or 0)
-    return totals
+            entry[key] += int(used.get(key) or 0)
+        elapsed = rec.get("elapsed_seconds")
+        if elapsed is not None and rec.get("status") == 200:
+            moves.setdefault(agent, []).append(float(elapsed))
+    inference = {}
+    for agent, values in moves.items():
+        inference[agent] = {
+            "total": round(sum(values), 2),
+            "moves": len(values),
+            "mean": round(sum(values) / len(values), 3),
+            "p50": _percentile(values, 0.5),
+            "max": round(max(values), 3),
+        }
+    return usage, inference
 
 
 def teardown(resources, keep=False):
@@ -648,6 +681,8 @@ def main():
     token_file_a = token_file_b = None
     resources = {"containers": [], "pod": None, "network": None}
     winner = reason = outcome = None
+    bank_summary = {}
+    control_url = None
     duration = 0.0
     pid_shared = None
     network_internal = None
@@ -798,6 +833,23 @@ def main():
         except OSError:
             pass
 
+        bank_summary = {}
+        final = {}
+        if control_url and proxy_name in resources["containers"]:
+            # Must happen before teardown removes the proxy container.
+            final = control_status(control_url, control_token) or {}
+        if mode.time_bank is not None:
+            for role, left in (final.get("banks") or {}).items():
+                if left is None:
+                    continue
+                bank_summary[role] = {
+                    "granted": mode.time_bank,
+                    "remaining": left,
+                    "used": round(mode.time_bank - left, 2),
+                    "exhausted": role in (final.get("exhausted") or []),
+                    "moves": (final.get("moves") or {}).get(role),
+                }
+
         if cont_a in resources["containers"]:
             collect_logs([cont_a, cont_b], match_dir, ["agent-a", "agent-b"])
 
@@ -821,13 +873,32 @@ def main():
             candidates = [n for n in (from_hb, from_log) if n is not None]
             commands[role] = max(candidates) if candidates else None
 
+        # Defence in depth against credential abuse. The proxy counts requests
+        # per bearer token; the harness reports the turns IT took. If an agent's
+        # token was used far more often than the agent itself acted, someone
+        # else spent its budget or its time bank - so the match is not a
+        # contest, whatever the scoreboard says.
+        abuse = None
+        for role, cont in (("agent-a", cont_a), ("agent-b", cont_b)):
+            served = (final.get("requests") or {}).get(role)
+            own_turns = ((last_state or {}).get(cont) or {}).get("steps")
+            if served is None or own_turns is None:
+                continue
+            if served > own_turns * 4 + 10:
+                abuse = (f"{role} was served {served} model requests but took only "
+                         f"{own_turns} turns; its credential may have been used by "
+                         f"the opponent")
+                break
+
         if rated:
             # The arena gate may already have marked this unrated; only decide
             # here if it did not.
             rated, unrated_reason = rating_decision(outcome, exit_codes, commands)
+        if abuse:
+            rated, unrated_reason = False, abuse
 
         winner_role = {cont_a: "agent-a", cont_b: "agent-b"}.get(winner, winner)
-        usage = summarize_usage(match_dir)
+        usage, inference = summarize_proxy_log(match_dir)
         result = {
             "schema_version": 2,
             "match_id": match_id,
@@ -862,6 +933,8 @@ def main():
             "exit_codes": exit_codes,
             "commands_run": commands,
             "usage": usage,
+            "inference_seconds": inference,
+            "time_bank": bank_summary,
             "containers": {
                 "agent_a": cont_a, "agent_b": cont_b, "proxy": proxy_name,
                 "pod": pod_name, "network": net_name,

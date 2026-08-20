@@ -122,35 +122,72 @@ Ratings are shown with a bootstrap 95% interval and marked provisional below
 `--min-games`. With a handful of matches that interval spans most of the table,
 which is the honest reading rather than a defect.
 
-## Fair mode (`--fair`)
+## Game modes
 
-Without intervention, a fast-inference model can kill a slow one before the
-slow model finishes its first move — the arena rewards latency, not strategy.
-`--fair` removes this advantage with **lockstep rounds**:
+Speed and intelligence trade off against each other: fast models are usually less
+capable. A wall-clock arena rewards provider latency; a purely turn-based one erases
+speed entirely. Neither is "correct" — they answer different questions. So the arena has
+four modes, **each with its own leaderboard**, the way chess keeps separate
+classical/rapid/blitz ratings. Ratings are never pooled across modes.
+
+| `--mode` | Rule | What it measures |
+|---|---|---|
+| `untimed` | Lockstep rounds, equal turns each, no clock at all. | Pure strategy — speed is removed entirely. |
+| `move-timed` | Lockstep rounds with a firm per-move deadline; miss it and you forfeit the round. | Strategy with a latency floor to clear. |
+| `time-bank` | Each agent gets a total thinking-time bank; its real inference time is deducted per move. | The tradeoff itself. |
+| `realtime` | No turn-taking, wall-clock bounded. Acting sooner is an advantage. | Speed as a legitimate weapon. |
 
 ```bash
-python3 src/orchestrator.py --fair \
-    --model-a '~deepseek/deepseek-v4-flash-latest' \
-    --model-b 'qwen/qwen3.8-27b' \
-    --move-timeout 90
+python3 src/orchestrator.py --mode time-bank --time-bank 300 \
+    --model-a openai/gpt-4o-mini --model-b anthropic/claude-3.5-haiku
 ```
 
-- Each round, both agents think independently, then **commit** their move at a
-  barrier hosted by the model proxy (`POST /barrier/join` + `GET /barrier/wait`).
-- Once both moves are committed, they execute **simultaneously**. A fast model
-  waits at the barrier for a slow one; inference speed no longer decides who
-  strikes first.
-- If one agent fails to commit within `--move-timeout` seconds, the round is
-  released partially and the waiting agent executes alone (a stalled model
-  loses rounds rather than stalling the match forever).
-- Mutual destruction is possible: if both commit a kill in the same round,
-  both may die — scored as a draw.
-- Win detection is unchanged (container exit / heartbeat loss); the barrier
-  only paces execution.
+### time-bank
 
-Related testing flags (mock mode only): `--mock-delay-a` / `--mock-delay-b`
-simulate slow-model latency in seconds per response, to verify the barrier
-holds rounds together.
+The most interesting of the four, and the one to watch. Both agents move in lockstep, but
+each is charged the time its **own** reasoning actually took. **Waiting at the barrier is
+free**, so a fast model is never punished for having a slow opponent. A 30s/move model and
+a 3s/move model trade blows evenly until the slow one's bank empties — then it can no
+longer act while the opponent plays on with everything it has left. Slow models get few
+moves; fast models get many; budgeting is a strategy.
+
+Both clocks are public. The remaining bank is shown to each model every turn, because in
+lockstep the time spent waiting at the barrier already *is* the opponent's thinking time —
+hiding it would only reward whichever model thought to measure that.
+
+Per-move inference time is measured **in the proxy**, with a monotonic clock, around the
+completion call only. The harness runs in a container the agent has a shell in, so nothing
+that affects scoring is timed there.
+
+### Mock-mode testing
+
+`--mock-delay-a` / `--mock-delay-b` simulate slow-model latency, and the mock delay is
+inside the timed region — so the whole time-bank mechanism is exercisable at **zero API
+cost**:
+
+```bash
+python3 src/orchestrator.py --mock --mode time-bank --time-bank 20 \
+    --mock-delay-a 5 --mock-delay-b 0.5
+# agent-a gets 4 moves, agent-b gets 40, and the match ends on banks_exhausted
+```
+
+## How lockstep works
+
+The three lockstep modes (`untimed`, `move-timed`, `time-bank`) share one mechanism:
+
+- Each round, both agents think independently, then **commit** their move at a barrier
+  hosted by the model proxy (`POST /barrier/join` + `GET /barrier/wait`).
+- Once both moves are committed they execute **simultaneously**, so inference speed does
+  not decide who strikes first.
+- If an agent stops participating — a spent time bank, or repeated missed deadlines — it
+  drops out of the quorum so the survivor is not stalled waiting for a player that will
+  never move again.
+- Mutual destruction is possible: if both commit a kill in the same round, both may die.
+  That is scored as a draw, and always counts toward the leaderboard.
+- Win detection is unchanged (container exit / heartbeat loss); the barrier only paces
+  execution.
+
+`--fair` is a **deprecated** alias for `--mode untimed` and prints a warning.
 
 ## Match artifacts
 

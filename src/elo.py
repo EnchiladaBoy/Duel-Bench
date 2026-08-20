@@ -24,7 +24,25 @@ def expected_score(ra, rb):
     return 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
 
 
-def eligibility(data, include_degraded=False, include_mock=False):
+LEGACY_POOL = "legacy"
+
+
+def pool_of(data):
+    """Which leaderboard a result belongs on. Modes are never pooled: they
+    impose different rules, so their ratings are not comparable."""
+    return data.get("mode") or LEGACY_POOL
+
+
+def partition(results):
+    """Group ordered results by mode. rate() and bootstrap_interval() are pure
+    functions of a result list, so each pool is simply rated independently."""
+    pools = {}
+    for data in results:
+        pools.setdefault(pool_of(data), []).append(data)
+    return pools
+
+
+def eligibility(data, include_degraded=False, include_mock=False, include_legacy=False):
     """Return None if the match is ratable, else a reason string."""
     if not data.get("model_a") or not data.get("model_b"):
         return "missing model ids"
@@ -34,6 +52,11 @@ def eligibility(data, include_degraded=False, include_mock=False):
         return "mock match (scripted agents, no model calls)"
     if data.get("rated") is False:
         return f"orchestrator marked unrated ({data.get('unrated_reason', 'no reason given')})"
+    if not data.get("mode") and not include_legacy:
+        # Unlike a missing arena field ("not recorded, probably fine"), a missing
+        # mode means we cannot know which leaderboard this belongs on, and
+        # guessing would recreate the pooling this partitioning exists to stop.
+        return "no mode recorded (pre-mode-system result); use --include-legacy"
     if not include_degraded:
         # Absent fields mean "written by a build that did not record this";
         # only an explicit False is treated as a degraded arena.
@@ -56,7 +79,8 @@ def sort_key(item):
     )
 
 
-def load_results(matches_dir, include_degraded=False, include_mock=False):
+def load_results(matches_dir, include_degraded=False, include_mock=False,
+                 include_legacy=False):
     rated, skipped = [], []
     for path in sorted(Path(matches_dir).glob("*/result.json")):
         try:
@@ -64,7 +88,7 @@ def load_results(matches_dir, include_degraded=False, include_mock=False):
         except (json.JSONDecodeError, OSError) as exc:
             skipped.append((path, f"unreadable: {exc}"))
             continue
-        reason = eligibility(data, include_degraded, include_mock)
+        reason = eligibility(data, include_degraded, include_mock, include_legacy)
         if reason:
             skipped.append((path, reason))
         else:
@@ -119,6 +143,21 @@ def bootstrap_interval(results, k, samples=BOOTSTRAP_SAMPLES, seed=0):
     return intervals
 
 
+def usage_per_model(results):
+    """Mean total tokens per match, reported beside ELO but never scored."""
+    totals, counts = {}, {}
+    for data in results:
+        usage = data.get("usage") or {}
+        for role, model in (("agent-a", data.get("model_a")),
+                            ("agent-b", data.get("model_b"))):
+            spent = (usage.get(role) or {}).get("total_tokens")
+            if not model or not spent:
+                continue
+            totals[model] = totals.get(model, 0) + spent
+            counts[model] = counts.get(model, 0) + 1
+    return {m: totals[m] / counts[m] for m in totals if counts.get(m)}
+
+
 def main():
     parser = argparse.ArgumentParser(description="agent-deathmatch ELO leaderboard")
     parser.add_argument("--matches-dir", default="matches")
@@ -129,12 +168,16 @@ def main():
                         help="rate matches whose arena was silently degraded (not recommended)")
     parser.add_argument("--include-mock", action="store_true",
                         help="rate --mock pipeline tests as if they were real matches")
+    parser.add_argument("--include-legacy", action="store_true",
+                        help="rate results written before modes existed, in a 'legacy' pool")
+    parser.add_argument("--mode", default=None,
+                        help="show only this mode's leaderboard")
     parser.add_argument("--quiet", action="store_true",
                         help="do not list skipped matches")
     args = parser.parse_args()
 
     results, skipped = load_results(
-        args.matches_dir, args.include_degraded, args.include_mock
+        args.matches_dir, args.include_degraded, args.include_mock, args.include_legacy
     )
 
     if skipped and not args.quiet:
@@ -149,21 +192,36 @@ def main():
             print("Every match on disk was skipped for the reasons above.")
         return 0
 
-    ratings, games = rate(results, args.k)
-    intervals = bootstrap_interval(results, args.k)
+    pools = partition(results)
+    if args.mode:
+        pools = {k: v for k, v in pools.items() if k == args.mode}
+        if not pools:
+            print(f"No rated matches in mode {args.mode!r}")
+            return 0
 
-    print(f"{'MODEL':<45} {'ELO':>7} {'95% CI':>17} {'GAMES':>6}")
-    print("-" * 78)
-    for model, rating in sorted(ratings.items(), key=lambda kv: -kv[1]):
-        lo, hi = intervals.get(model, (float("nan"), float("nan")))
-        ci = f"{lo:.0f} - {hi:.0f}" if lo == lo else "n/a"
-        flag = "  *" if games[model] < args.min_games else ""
-        print(f"{model:<45} {rating:>7.0f} {ci:>17} {games[model]:>6}{flag}")
+    for pool_name in sorted(pools):
+        pool = pools[pool_name]
+        ratings, games = rate(pool, args.k)
+        intervals = bootstrap_interval(pool, args.k)
+        usage = usage_per_model(pool)
 
-    print(f"\n({len(results)} rated matches, K={args.k})")
-    if any(games[m] < args.min_games for m in ratings):
-        print(f"* provisional: fewer than {args.min_games} games; the interval spans "
-              f"most of the table, so ordering here is not meaningful.")
+        print(f"\n=== {pool_name} ({len(pool)} rated matches, K={args.k}) ===")
+        print(f"{'MODEL':<40} {'ELO':>7} {'95% CI':>17} {'GAMES':>6} {'TOK/MATCH':>10}")
+        print("-" * 84)
+        for model, rating in sorted(ratings.items(), key=lambda kv: -kv[1]):
+            lo, hi = intervals.get(model, (float("nan"), float("nan")))
+            ci = f"{lo:.0f} - {hi:.0f}" if lo == lo else "n/a"
+            flag = "  *" if games[model] < args.min_games else ""
+            tokens = usage.get(model)
+            tok = f"{tokens:,.0f}" if tokens else "-"
+            print(f"{model:<40} {rating:>7.0f} {ci:>17} {games[model]:>6} {tok:>10}{flag}")
+        if any(games[m] < args.min_games for m in ratings):
+            print(f"* provisional: fewer than {args.min_games} games; the interval "
+                  f"spans most of the table, so ordering here is not meaningful.")
+
+    if len(pools) > 1:
+        print("\nModes are rated separately and are NOT comparable: each imposes "
+              "different rules, so a rating in one says nothing about another.")
     return 0
 
 

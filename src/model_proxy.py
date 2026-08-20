@@ -51,11 +51,28 @@ LOCKSTEP = MODE.lockstep
 ROUND_TIMEOUT = MODE.move_deadline or 90.0
 MAX_MISSED_ROUNDS = MODE.max_missed_rounds or 2
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(4 * 1024 * 1024)))
+# The harness must wait LONGER than this (see agent_harness.CLIENT_TIMEOUT), or
+# it abandons a response the proxy is still fetching, retries, and spends a
+# second upstream call - which with a time bank double-charges one move.
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "180"))
+BANK_GRACE = 5.0
 KEEP_RELEASES = 200
 
 LOCK = threading.Lock()
 REQUEST_COUNT = {token: 0 for token in TOKENS}
 TOKEN_USAGE = {token: 0 for token in TOKENS}
+# Seconds of inference left to each agent. Charged for time a completion is
+# actually in flight; waiting at the barrier is free, so a fast model is never
+# punished for having a slow opponent.
+BANK_REMAINING = {token: MODE.time_bank for token in TOKENS}
+MOVE_SECONDS = {token: [] for token in TOKENS}
+# Mutated and read under LOCK only, so the exhaustion test is atomic with the
+# charge. Barrier retirement happens separately, outside LOCK.
+EXHAUSTED = set()
+# An agent has at most one move in flight. Without this, K concurrent requests
+# on one token each pass the bank check before any of them charges, delivering
+# K x the bank's worth of inference for the price of one.
+IN_FLIGHT = set()
 MOCK_INDEX = {token: 0 for token in TOKENS}
 _LOG_FH = None
 
@@ -120,7 +137,9 @@ def _release_unlocked(complete):
     drops out of the quorum so a survivor does not pay ROUND_TIMEOUT forever."""
     joined = set(barrier["joined"])
     record = {
-        "both": complete,
+        # True only if every agent still in the game committed a move this
+        # round - not merely that a shrunken quorum was satisfied.
+        "both": complete and len(joined) >= len(TOKENS),
         "joined": sorted(role_of(t) for t in joined),
     }
     barrier["releases"][barrier["round"]] = record
@@ -146,18 +165,38 @@ def barrier_join(token):
     with BARRIER_COND:
         round_no = barrier["round"]
         barrier["joined"].add(token)
-        barrier["active"].add(token)      # a returning agent rejoins the quorum
+        # A merely-absent agent rejoins the quorum; an agent whose time bank is
+        # spent does not, or it would stall the survivor every round forever.
+        if token not in EXHAUSTED:
+            barrier["active"].add(token)
         barrier["missed"][token] = 0
         if barrier["deadline"] is None:
             barrier["deadline"] = time.time() + ROUND_TIMEOUT
-        if barrier["active"] and barrier["joined"] >= barrier["active"]:
-            record = _release_unlocked(complete=True)
+        # An empty active set means every agent has retired (all banks spent).
+        # Short-circuiting to False there would leave a round that BOTH agents
+        # joined permanently unreleased, stalling them for a full deadline.
+        if barrier["joined"] >= barrier["active"]:
+            record = _release_unlocked(complete=bool(barrier["active"]))
             return {"round": round_no, "released": True, **record}
         return {
             "round": round_no,
             "released": False,
             "joined": sorted(role_of(t) for t in barrier["joined"]),
         }
+
+
+def retire_from_barrier(token):
+    """Retire an agent from the barrier the instant its bank empties.
+
+    Without the immediate release the survivor blocks in barrier_wait until the
+    round deadline expires, then pays it again until max_missed_rounds ejects
+    the dead token - minutes of dead time at the most dramatic moment of the
+    match."""
+    with BARRIER_COND:
+        barrier["active"].discard(token)
+        if barrier["joined"] >= barrier["active"]:
+            _release_unlocked(complete=bool(barrier["active"]))
+        BARRIER_COND.notify_all()
 
 
 def barrier_wait(round_no, token):
@@ -189,8 +228,19 @@ def barrier_wait(round_no, token):
 
 # --------------------------------------------------------------- backends
 
+def mock_delay_for(token, index):
+    """MOCK_SLEEP may be a scalar or a per-move list (cycled), so a time bank
+    can be exercised against varying inference latency at zero API cost."""
+    spec = MOCK_SLEEP.get(token, 0)
+    if isinstance(spec, list):
+        return float(spec[index % len(spec)]) if spec else 0.0
+    return float(spec or 0)
+
+
 def mock_completion(token):
-    delay = float(MOCK_SLEEP.get(token, 0) or 0)
+    with LOCK:
+        delay_index = MOCK_INDEX.get(token, 0)
+    delay = mock_delay_for(token, delay_index)
     if delay > 0:
         time.sleep(delay)
     with LOCK:
@@ -256,7 +306,7 @@ def build_upstream_payload(body, model):
     return payload
 
 
-def forward_openrouter(body, model):
+def forward_openrouter(body, model, timeout=None):
     payload = build_upstream_payload(body, model)
     request = urllib.request.Request(
         OPENROUTER_URL,
@@ -270,7 +320,7 @@ def forward_openrouter(body, model):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=timeout or UPSTREAM_TIMEOUT) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode(errors="replace")
@@ -368,15 +418,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             with BARRIER_COND:
                 round_no = barrier["round"]
                 active = sorted(role_of(t) for t in barrier["active"])
+            with LOCK:
+                # Snapshot under the lock that guards them: iterating EXHAUSTED
+                # while a completion thread adds to it raises "Set changed size
+                # during iteration" and 500s the orchestrator's poll.
+                exhausted = sorted(role_of(t) for t in EXHAUSTED)
+                banks = {role_of(t): (round(v, 2) if v is not None else None)
+                         for t, v in BANK_REMAINING.items()}
+                moves = {role_of(t): len(v) for t, v in MOVE_SECONDS.items()}
+                all_spent = len(EXHAUSTED) >= len(TOKENS)
+            terminal = None
+            if MODE.termination == "banks" and all_spent:
+                terminal = "banks_exhausted"
             send_json(self, 200, {
                 "mode": MODE.name,
                 "round": round_no,
                 "active": active,
+                "exhausted": exhausted,
+                "banks": banks,
+                "moves": moves,
                 "requests": {role_of(t): n for t, n in requests_used.items()},
                 "tokens": {role_of(t): n for t, n in tokens_used.items()},
-                # Populated once round/bank termination lands; the orchestrator
-                # already treats a null terminal as "keep playing".
-                "terminal": None,
+                "terminal": terminal,
             })
             return
 
@@ -441,34 +504,112 @@ class ProxyHandler(BaseHTTPRequestHandler):
             send_json(self, err[0], err[1])
             return
 
+        # Admission is decided in ONE critical section: bank exhaustion, the
+        # request budget, and the one-move-in-flight rule. Splitting these let
+        # concurrent requests on a single token each pass a nearly-empty bank.
         with LOCK:
-            over_requests = REQUEST_COUNT[token] >= MAX_REQUESTS
-            over_tokens = (
-                MAX_TOKENS_BUDGET and TOKEN_USAGE[token] >= MAX_TOKENS_BUDGET
-            )
-            if not (over_requests or over_tokens):
+            if MODE.time_bank is not None and token in EXHAUSTED:
+                refusal, remaining = "time_bank_exhausted", None
+            elif token in IN_FLIGHT:
+                refusal, remaining = "concurrent_request", None
+            elif REQUEST_COUNT[token] >= MAX_REQUESTS or (
+                    MAX_TOKENS_BUDGET and TOKEN_USAGE[token] >= MAX_TOKENS_BUDGET):
+                refusal, remaining = "proxy_budget", None
+            else:
                 REQUEST_COUNT[token] += 1
-        if over_requests or over_tokens:
+                IN_FLIGHT.add(token)
+                refusal, remaining = None, BANK_REMAINING.get(token)
+
+        if refusal == "time_bank_exhausted":
+            # A GAME outcome, so it must not reuse "proxy_budget", which the
+            # harness treats as terminal infrastructure failure - that would
+            # mark every time-bank match unrated, the inverse of the intent.
+            send_json(self, 429, {"error": "time bank exhausted",
+                                  "error_kind": "time_bank_exhausted"})
+            return
+        if refusal == "concurrent_request":
+            send_json(self, 429, {"error": "one move in flight at a time",
+                                  "error_kind": "concurrent_request"})
+            return
+        if refusal == "proxy_budget":
             log({"event": "budget_exhausted", "agent": role_of(token),
                  "requests": REQUEST_COUNT[token], "tokens": TOKEN_USAGE[token]})
-            send_json(self, 429, {
-                "error": "request budget exhausted",
-                "error_kind": "proxy_budget",
-            })
+            send_json(self, 429, {"error": "request budget exhausted",
+                                  "error_kind": "proxy_budget"})
             return
 
-        if MOCK:
-            status, response = 200, mock_completion(token)
-        else:
-            if not API_KEY:
-                send_json(self, 500, {"error": "proxy has no OPENROUTER_API_KEY"})
-                return
-            status, response = forward_openrouter(body, TOKENS[token])
+        # Clamp the call so an agent with two seconds left cannot burn a full
+        # upstream timeout. Without this the bank is not a bank.
+        call_timeout = None
+        if MODE.time_bank is not None and remaining is not None:
+            call_timeout = max(1.0, min(UPSTREAM_TIMEOUT, remaining + BANK_GRACE))
+
+        # Timed here - after validation and admission, around the dispatch only -
+        # and with a monotonic clock, so a wall-clock step can neither refund nor
+        # steal a bank. Measured proxy-side because the harness runs in a
+        # container the agent has a shell in.
+        started = time.monotonic()
+        try:
+            if MOCK:
+                status, response = 200, mock_completion(token)
+            else:
+                if not API_KEY:
+                    with LOCK:
+                        IN_FLIGHT.discard(token)
+                    send_json(self, 500, {"error": "proxy has no OPENROUTER_API_KEY"})
+                    return
+                status, response = forward_openrouter(body, TOKENS[token], timeout=call_timeout)
+        except Exception:
+            with LOCK:
+                IN_FLIGHT.discard(token)
+            raise
+        elapsed = time.monotonic() - started
+
+        # A call cut short by the bank clamp comes back as an upstream failure,
+        # but the time was really spent. Charging only successes would leave the
+        # bank stuck just above zero forever: the agent would never exhaust,
+        # `terminal` would never fire, and the match would run to the guard.
+        bank_overrun = (call_timeout is not None and status != 200
+                        and elapsed >= call_timeout - 1.0)
 
         usage = response.get("usage") if isinstance(response, dict) else None
-        if isinstance(usage, dict):
-            with LOCK:
-                TOKEN_USAGE[token] += int(usage.get("total_tokens") or 0)
+        newly_exhausted = False
+        with LOCK:
+            IN_FLIGHT.discard(token)
+            if isinstance(usage, dict):
+                try:
+                    TOKEN_USAGE[token] += int(usage.get("total_tokens") or 0)
+                except (TypeError, ValueError):
+                    # A provider returning a non-numeric token count must not
+                    # blow up the handler and hand the agent a free move.
+                    pass
+            if status == 200 or bank_overrun:
+                # Charge for a usable answer, or for time the clamp cut short.
+                # An ordinary upstream failure is not the model's fault.
+                MOVE_SECONDS[token].append(round(elapsed, 3))
+                if MODE.time_bank is not None and BANK_REMAINING[token] is not None:
+                    BANK_REMAINING[token] = max(0.0, BANK_REMAINING[token] - elapsed)
+                    if BANK_REMAINING[token] <= 0 and token not in EXHAUSTED:
+                        EXHAUSTED.add(token)
+                        newly_exhausted = True
+        if newly_exhausted:
+            # Outside LOCK: retire_from_barrier takes BARRIER_COND.
+            retire_from_barrier(token)
+            log({"event": "bank_exhausted", "agent": role_of(token),
+                 "moves": len(MOVE_SECONDS[token]),
+                 "cause": "bank_clamp" if bank_overrun else "spent"})
+
+        if bank_overrun:
+            log({"event": "completion", "agent": role_of(token), "model": TOKENS[token],
+                 "mock": MOCK, "status": 429, "elapsed_seconds": round(elapsed, 3),
+                 "usage": None, "bank_remaining": 0.0,
+                 "requests_used": REQUEST_COUNT[token], "messages_in": len(body.get("messages") or [])})
+            send_json(self, 429, {"error": "time bank exhausted mid-call",
+                                  "error_kind": "time_bank_exhausted"})
+            return
+
+        if isinstance(response, dict):
+            response["arena"] = self._arena_block(token, elapsed)
 
         log({
             "event": "completion",
@@ -476,12 +617,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "model": TOKENS[token],
             "mock": MOCK,
             "status": status,
+            "elapsed_seconds": round(elapsed, 3),
             "usage": usage,
             "cumulative_tokens": TOKEN_USAGE[token],
             "requests_used": REQUEST_COUNT[token],
+            "bank_remaining": (round(BANK_REMAINING[token], 2)
+                               if BANK_REMAINING.get(token) is not None else None),
             "messages_in": len(body.get("messages") or []),
         })
         send_json(self, status, response)
+
+    def _arena_block(self, token, elapsed):
+        """State the model needs to play this mode, returned in the response
+        body (headers are dropped by the harness's call_model). Keyed by role,
+        never by token."""
+        arena = {"mode": MODE.name, "move_seconds": round(elapsed, 2)}
+        if LOCKSTEP:
+            with BARRIER_COND:
+                arena["round"] = barrier["round"]
+        if MODE.time_bank is None:
+            return arena
+        arena["bank_remaining"] = round(BANK_REMAINING[token] or 0.0, 1)
+        arena["exhausted"] = token in EXHAUSTED
+        if MODE.reveal_opponent_bank:
+            # Disclosed deliberately, rounded to whole seconds. In lockstep the
+            # time an agent spends blocked at the barrier already IS its
+            # opponent's think time, so hiding it would only reward whichever
+            # model thought to measure that - and chess clocks are public.
+            for other, left in BANK_REMAINING.items():
+                if other != token:
+                    arena["opponent"] = role_of(other)
+                    # round, not floor: int() reported an opponent with 0.4s
+                    # left as "~0s", i.e. already beaten, at the exact
+                    # moment that claim is most consequential.
+                    arena["opponent_bank_remaining"] = max(0, round(left or 0))
+        return arena
 
     def log_message(self, fmt, *args):
         pass

@@ -32,6 +32,7 @@ STATE = {
     "model_errors": 0,
     "stop_reason": None,
     "commands_run": 0,
+    "arena": None,
 }
 
 # Exit codes the orchestrator interprets (see orchestrator.classify_exit).
@@ -78,6 +79,11 @@ MAX_MODEL_ERRORS = int(os.environ.get("MAX_MODEL_ERRORS", "5"))
 LOCKSTEP = MODE.lockstep
 ROUND_TIMEOUT = MODE.move_deadline or 90.0
 PROXY_BASE = PROXY_URL.rsplit("/v1/", 1)[0]
+# Strictly greater than the proxy's own upstream timeout. If the harness gave up
+# first it would abandon a response the proxy is still fetching and retry,
+# spending a second upstream call - which with a time bank charges one move
+# twice.
+CLIENT_TIMEOUT = float(os.environ.get("CLIENT_TIMEOUT", "210"))
 
 TOOLS = [
     {
@@ -363,8 +369,24 @@ def call_model(messages):
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=180) as response:
+    with urllib.request.urlopen(request, timeout=CLIENT_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def format_clock(arena):
+    """One line of arena state for the model's next turn.
+
+    It cannot live in the system prompt - that is built once at startup - so it
+    rides along with each command result."""
+    if not isinstance(arena, dict) or arena.get("bank_remaining") is None:
+        return ""
+    parts = [f"you: {arena['bank_remaining']:.1f}s left"]
+    if arena.get("opponent_bank_remaining") is not None:
+        parts.append(f"{arena.get('opponent', 'opponent')}: "
+                     f"~{arena['opponent_bank_remaining']}s left")
+    if arena.get("round"):
+        parts.append(f"round {arena['round']}")
+    return "[clock] " + " | ".join(parts)
 
 
 def barrier_join():
@@ -508,6 +530,11 @@ def main():
                         kind = json.loads(body).get("error_kind")
                     except (json.JSONDecodeError, AttributeError):
                         kind = None
+                    if kind == "time_bank_exhausted":
+                        # Out of thinking time is a GAME outcome, not an
+                        # infrastructure failure: stay alive, stay killable,
+                        # and let the opponent play out its remaining bank.
+                        idle("time_bank_exhausted")
                     if kind == "proxy_budget":
                         idle("budget_exhausted", fatal=True)
                 time.sleep(2 * attempt)
@@ -523,6 +550,9 @@ def main():
             continue
 
         STATE["model_errors"] = 0
+        arena = response.get("arena") if isinstance(response, dict) else None
+        if isinstance(arena, dict):
+            STATE["arena"] = arena
         action = extract_command(response)
         log(
             "model_response",
@@ -607,12 +637,14 @@ def main():
         result = run_command(command)
         log("command_result", {"step": step, **result})
 
+        clock = format_clock(arena)
         if action["kind"] == "tool_call":
+            content = json.dumps(result, ensure_ascii=False)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": action.get("tool_call_id") or f"call_{step}",
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": content + ("\n" + clock if clock else ""),
                 }
             )
         else:
@@ -620,7 +652,8 @@ def main():
                 {
                     "role": "user",
                     "content": "Command output:\n"
-                    + json.dumps(result, ensure_ascii=False, indent=2),
+                    + json.dumps(result, ensure_ascii=False, indent=2)
+                    + ("\n" + clock if clock else ""),
                 }
             )
 

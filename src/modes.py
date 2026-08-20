@@ -36,9 +36,9 @@ Mode = namedtuple("Mode", [
     "speed_scored",          # bool - documentation and result.json only
 ])
 
-# max_steps and max_requests are DERIVED here rather than being free-floating
-# CLI flags, because either can silently pre-empt a mode's own termination
-# condition. The time-bank row is the sharp case: a fast model with a 300s bank
+# max_steps, max_requests and max_rounds are DERIVED here rather than being
+# free-floating CLI flags, because ANY of them can silently pre-empt a mode's own
+# termination condition and then mislabel why the match ended. The time-bank row is the sharp case: a fast model with a 300s bank
 # at 0.5s/move wants ~600 moves and would hit a 200-request budget long before
 # its bank ran dry - and budget exhaustion is fatal, so every such match would
 # be scored unrated. Hence 1200 there.
@@ -80,15 +80,22 @@ MODES = {
         name="time-bank",
         lockstep=True,
         termination="banks",
-        max_rounds=300,          # guard only; banks are the real terminator
-        move_deadline=None,      # the remaining bank IS the per-move cap
+        max_rounds=2000,         # guard only; banks are the real terminator
+        # NOT None: a None here was being coerced to a 90s default downstream,
+        # imposing a per-move deadline this mode deliberately does not have.
+        # This is a barrier guard comfortably above any single legal call.
+        move_deadline=240.0,
         deadline_effect="guard",
         max_missed_rounds=2,
         time_bank=300.0,
         reveal_opponent_bank=True,
         wall_clock=3600.0,
-        max_steps=400,
-        max_requests=1200,
+        # A 300s bank spent by a 0.2s/move model buys ~1500 moves. Caps below
+        # that would stop the agent with bank unspent and mislabel the outcome
+        # "banks_exhausted" - exactly the silent pre-emption this module exists
+        # to prevent.
+        max_steps=2000,
+        max_requests=2500,
         speed_scored=True,
     ),
     "realtime": Mode(

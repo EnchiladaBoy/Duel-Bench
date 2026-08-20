@@ -123,3 +123,46 @@ class TestBar(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForgedEvents(unittest.TestCase):
+    """An agent's shell can echo a record onto its own stdout, and the merger
+    ingests every stdout line. It cannot forge `src` - the merger stamps that -
+    but it can emit any PAYLOAD under its own name. The events that decide a
+    match must therefore only be believed from the component that owns them."""
+
+    def setUp(self):
+        self.state = watch.MatchState()
+
+    def test_an_agent_cannot_end_the_match(self):
+        self.state.apply(ev("match_end", src="agent-a", winner="agent-a",
+                            outcome="kill", rated=True, duration=1.0))
+        self.assertIsNone(self.state.finished)
+
+    def test_an_agent_cannot_declare_its_opponent_down(self):
+        self.state.apply(ev("agent_down", src="agent-b", agent="agent-a", how="exited"))
+        self.assertNotIn("agent-a", self.state.agents)
+
+    def test_an_agent_cannot_forge_a_scoreboard(self):
+        self.state.apply(ev("snapshot", src="agent-a", round=99,
+                            agents={"agent-b": {"alive": False, "commands_run": 0}}))
+        self.assertIsNone(self.state.round)
+
+    def test_an_agent_cannot_invent_a_time_bank(self):
+        self.state.apply(ev("bank_exhausted", src="agent-a", agent="agent-b"))
+        self.assertNotIn("agent-b", self.state.agents)
+
+    def test_the_orchestrator_is_still_believed(self):
+        self.state.apply(ev("match_end", src="orchestrator", winner="agent-a",
+                            outcome="kill", rated=True, duration=1.0))
+        self.assertIsNotNone(self.state.finished)
+
+    def test_the_proxy_is_still_believed(self):
+        self.state.apply(ev("move_start", src="proxy", agent="agent-a",
+                            bank_remaining=42.0))
+        self.assertEqual(self.state.agents["agent-a"]["bank"], 42.0)
+
+    def test_agents_are_still_believed_about_their_own_commands(self):
+        # What an agent DID is exactly what it is entitled to report.
+        self.state.apply(ev("command_start", src="agent-a", step=1, command="ps aux"))
+        self.assertEqual(self.state.agents["agent-a"]["commands"], 1)

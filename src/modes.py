@@ -18,6 +18,7 @@ is always on sys.path[0].
 """
 
 import json
+import sys
 from collections import namedtuple
 
 Mode = namedtuple("Mode", [
@@ -95,7 +96,7 @@ MODES = {
         # "banks_exhausted" - exactly the silent pre-emption this module exists
         # to prevent.
         max_steps=2000,
-        max_requests=2500,
+        max_requests=6500,
         speed_scored=True,
     ),
     "realtime": Mode(
@@ -110,7 +111,7 @@ MODES = {
         reveal_opponent_bank=False,
         wall_clock=600.0,
         max_steps=80,
-        max_requests=200,
+        max_requests=300,
         speed_scored=True,
     ),
 }
@@ -144,6 +145,39 @@ def names():
     return sorted(MODES)
 
 
+# The harness retries a failed step up to this many times, and every attempt
+# spends a request. If max_requests can be reached before max_steps, an
+# unlucky-but-honest agent is stopped by a safety net instead of by the mode's
+# own terminator - and the request budget stops being evidence of anything.
+MAX_MODEL_RETRIES = 3
+
+
+def budget_binds_early(mode):
+    """Whether this mode's request budget could be reached before its step cap.
+
+    When it can, an unlucky-but-honest agent is stopped by a safety net rather
+    than by the mode's own terminator - and the request budget stops being
+    evidence of anything."""
+    return mode.max_requests <= mode.max_steps * MAX_MODEL_RETRIES
+
+
+def check_budget_invariant(mode, shipped=False):
+    """Hard error for a shipped mode; a warning for a deliberate override.
+
+    A mode in the table getting this wrong is a bug. An operator overriding both
+    knobs is making a choice, and a test wanting a three-request budget is
+    legitimate - so say so and continue."""
+    if not budget_binds_early(mode):
+        return mode
+    message = (f"{mode.name}: max_requests={mode.max_requests} can be reached before "
+               f"max_steps={mode.max_steps} (needs > {mode.max_steps * MAX_MODEL_RETRIES}); "
+               f"the request budget would bind before the mode's own terminator")
+    if shipped:
+        raise ModeError(message)
+    print(f"[warn] {message}", file=sys.stderr)
+    return mode
+
+
 def resolve(name, **overrides):
     """Return the Mode for `name` with any non-None overrides applied.
 
@@ -164,7 +198,8 @@ def resolve(name, **overrides):
                 f"(applies to: {', '.join(OVERRIDE_APPLIES[field])})"
             )
         applied[field] = value
-    return mode._replace(**applied) if applied else mode
+    return check_budget_invariant(mode._replace(**applied) if applied else mode,
+                                  shipped=not applied)
 
 
 def to_env(mode):
@@ -233,3 +268,12 @@ def prompt_note(mode):
         "advantage. The match ends after "
         f"{mode.wall_clock:.0f} seconds of wall clock.\n"
     )
+
+
+# A shipped mode getting this wrong is a bug, so fail at import rather than
+# mid-match. realtime and time-bank both violated it before this check existed.
+for _name, _mode in MODES.items():
+    if budget_binds_early(_mode):
+        raise ModeError(
+            f"mode table is inconsistent: {_name} max_requests={_mode.max_requests} "
+            f"<= max_steps*{MAX_MODEL_RETRIES}={_mode.max_steps * MAX_MODEL_RETRIES}")

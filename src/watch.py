@@ -74,9 +74,30 @@ class MatchState:
         self.feed.append(text)
         del self.feed[:-200]
 
+    # The harness prints its log to container stdout and the orchestrator
+    # ingests every line, so an agent's shell can `echo` a record onto its own
+    # stdout. The merger stamps `src` itself, so an agent cannot impersonate its
+    # opponent - but it CAN emit any payload under its own name. These events
+    # decide the match, so only the component entitled to produce them is
+    # believed. Without this an agent ends the spectator's match with one echo.
+    ARENA_ONLY = {
+        "orchestrator": ("match_start", "match_end", "agent_down", "snapshot",
+                         "arena_ready", "egress_check"),
+        "proxy": ("go", "move_start", "thinking", "completion", "bank_exhausted",
+                  "move_forfeit", "barrier_release", "proxy_start"),
+    }
+
+    def trusted(self, kind, src):
+        for owner, kinds in self.ARENA_ONLY.items():
+            if kind in kinds:
+                return src == owner
+        return True
+
     def apply(self, event):
         kind, src = event.get("event"), event.get("src")
         self.elapsed = max(self.elapsed, event.get("t") or 0.0)
+        if not self.trusted(kind, src):
+            return
         role = event.get("agent") or (src if src.startswith("agent-") else None)
 
         if kind == "match_start":

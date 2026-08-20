@@ -92,3 +92,28 @@ class TestPromptNote(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBudgetInvariant(unittest.TestCase):
+    """The harness retries a failed step up to MAX_MODEL_RETRIES times and every
+    attempt spends a request. If the request budget can bind before the step cap,
+    an unlucky-but-honest agent is stopped by a safety net rather than by the
+    mode's own terminator - and the budget stops being evidence of anything."""
+
+    def test_every_shipped_mode_satisfies_it(self):
+        # realtime (200 vs 240) and time-bank (2500 vs 6000) both violated this
+        # before the check existed.
+        for name in modes.names():
+            mode = modes.resolve(name)
+            self.assertFalse(modes.budget_binds_early(mode), name)
+
+    def test_the_table_is_validated_at_import(self):
+        bad = modes.MODES["realtime"]._replace(max_requests=1)
+        with self.assertRaises(modes.ModeError):
+            modes.check_budget_invariant(bad, shipped=True)
+
+    def test_a_deliberate_override_warns_rather_than_raising(self):
+        # A test wanting a three-request budget is legitimate; an operator
+        # overriding both knobs is making a choice.
+        mode = modes.resolve("untimed", max_requests=3)
+        self.assertEqual(mode.max_requests, 3)

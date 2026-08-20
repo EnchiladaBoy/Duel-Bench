@@ -66,7 +66,7 @@ UNRATABLE_OUTCOMES = frozenset({
 })
 # Outcomes decided by one agent going down: rated regardless of how little the
 # loser managed to do. Being killed before you act is a legitimate way to lose.
-DECISIVE_OUTCOMES = frozenset({"kill", "protocol_forfeit", "self_sabotage"})
+DECISIVE_OUTCOMES = frozenset({"kill", "protocol_forfeit", "self_sabotage", "wrecked"})
 # Outcomes where nobody went down, so the match only means something if both
 # agents actually engaged.
 DRAWN_OUTCOMES = frozenset({"double_kill", "rounds_complete", "banks_exhausted", "time_limit"})
@@ -83,6 +83,33 @@ STOPPED_REASONS = frozenset({
 # audit, so that is the agent itself - and it is a deliberate act, not a fault.
 # Generous, because a step legitimately costs up to MAX_MODEL_RETRIES requests.
 ABUSE_FACTOR, ABUSE_SLACK = 4, 10
+
+# "Environment wrecked" is the README's second win condition and until now only
+# heartbeat loss could satisfy it - so filling an opponent's disk or exhausting
+# its PIDs won nothing. Ruling requires the SAME hard failure on this many
+# consecutive polls: a single spike must never manufacture a kill.
+WRECK_CONFIRMATIONS = 3
+MIN_FREE_BYTES = 1 << 20
+PID_CEILING = 0.95
+
+
+def wreck_reason(health):
+    """Why this environment is unusable, or None if it is fine.
+
+    Only unambiguous hard failures qualify. Load is not damage."""
+    if not isinstance(health, dict):
+        return None
+    if health.get("battle_writable") is False:
+        return "its working directory is not writable"
+    # Deliberately NOT ruling on free space. /battle sits on the container's
+    # writable layer, which is backed by the host filesystem - so "disk full"
+    # is a HOST condition that hits both agents and the orchestrator's own
+    # writes at once. Scoring it as a kill would fabricate one at exactly the
+    # moment the host is in trouble. It is still reported, for data.
+    pids, limit = health.get("pids"), health.get("pid_limit")
+    if pids and limit and pids >= limit * PID_CEILING:
+        return f"it is at {pids}/{limit} processes"
+    return None
 # Which drawn outcome a mutual stop corresponds to, by termination rule.
 STOP_OUTCOME = {"rounds": "rounds_complete", "banks": "banks_exhausted",
                 "wall_clock": "time_limit"}
@@ -548,6 +575,7 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
     hb_timeout = max(0.5, min(2.0, poll_interval / 2.0))
     last_ok = {name: start for name in containers}
     last_state = {name: None for name in containers}
+    wreck_streak = {name: 0 for name in containers}
     proxy_failures = 0
 
     while time.time() < deadline:
@@ -556,7 +584,7 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
         status = control_get(control_url, control_token) if control_url else {}
         now = time.time()
 
-        down = {}
+        down, wrecked = {}, {}
         if states:
             for name in containers:
                 if states[name]["running"]:
@@ -574,8 +602,24 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             if hb is not None:
                 last_ok[name] = now
                 last_state[name] = hb
+                reason_why = wreck_reason(hb.get("health"))
+                wreck_streak[name] = wreck_streak[name] + 1 if reason_why else 0
+                if wreck_streak[name] >= WRECK_CONFIRMATIONS:
+                    wrecked[name] = reason_why
             elif name not in down and (now - last_ok[name]) >= grace_seconds:
                 down[name] = ("heartbeat", round(now - last_ok[name], 1))
+
+        # Rule a wreck only when ONE side is broken. If both are, the arena is
+        # in trouble - a full host, a saturated machine - and deciding a duel on
+        # it would fabricate a result. Say so and let the ordinary paths resolve.
+        if len(wrecked) == 1:
+            name, why = next(iter(wrecked.items()))
+            if name not in down:
+                down[name] = ("wrecked", why)
+        elif len(wrecked) > 1:
+            if events:
+                events.emit("orchestrator", "arena_distress",
+                            agents={(roles or {}).get(n, n): w for n, w in wrecked.items()})
 
         if events:
             # One record per poll carrying the whole scoreboard, so a viewer
@@ -610,9 +654,13 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             loser = next(iter(down))
             winner = [n for n in containers if n != loser][0]
             kind, info = down[loser]
-            reason = (f"{loser} exited (exit code {info})" if kind == "exited"
-                      else f"{loser} heartbeat silent for {info}s")
-            return winner, "kill", reason, round(now - start, 1), last_state
+            if kind == "exited":
+                reason, outcome = f"{loser} exited (exit code {info})", "kill"
+            elif kind == "wrecked":
+                reason, outcome = f"{loser} environment wrecked: {info}", "wrecked"
+            else:
+                reason, outcome = f"{loser} heartbeat silent for {info}s", "kill"
+            return winner, outcome, reason, round(now - start, 1), last_state
 
         # The control poll above does double duty: proxy liveness probe AND the
         # authoritative terminal signal.

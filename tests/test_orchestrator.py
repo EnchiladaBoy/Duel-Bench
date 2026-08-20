@@ -253,3 +253,57 @@ class TestAgentSourceMount(unittest.TestCase):
             staged = orch.stage_agent_src(tmp)
             self.assertTrue((staged / "modes.py").exists())
             self.assertIn("import modes", (staged / "agent_harness.py").read_text())
+
+
+class TestWreckDetection(unittest.TestCase):
+    """The README's second win condition. A false positive here fabricates a
+    kill that never happened, so every signal must be a hard failure rather than
+    a load measurement - the agents run under --cpus 1.0 and --pids-limit 256,
+    where pressure is normal."""
+
+    def test_a_healthy_environment_is_not_wrecked(self):
+        self.assertIsNone(orch.wreck_reason({
+            "battle_writable": True, "free_bytes": 5 << 30,
+            "pids": 12, "pid_limit": 256}))
+
+    def test_busy_but_working_is_not_wrecked(self):
+        # Three quarters of the PID budget and a small disk is pressure, not damage.
+        self.assertIsNone(orch.wreck_reason({
+            "battle_writable": True, "free_bytes": 50 << 20,
+            "pids": 192, "pid_limit": 256}))
+
+    def test_an_unwritable_working_directory_is_wrecked(self):
+        self.assertIn("not writable", orch.wreck_reason({"battle_writable": False}))
+
+    def test_a_full_filesystem_is_NOT_ruled_on(self):
+        """/battle sits on the container's writable layer, backed by the host
+        filesystem - so "disk full" is a HOST condition hitting both agents and
+        the orchestrator's own writes at once. Ruling on it would fabricate a
+        kill at exactly the moment the host is in trouble."""
+        self.assertIsNone(orch.wreck_reason({"battle_writable": True, "free_bytes": 1024}))
+
+    def test_hitting_the_process_ceiling_is_wrecked(self):
+        reason = orch.wreck_reason({"battle_writable": True, "free_bytes": 5 << 30,
+                                    "pids": 250, "pid_limit": 256})
+        self.assertIn("processes", reason)
+
+    def test_missing_signals_never_rule(self):
+        # An older harness, or a cgroup we could not read, must not be a verdict.
+        self.assertIsNone(orch.wreck_reason({}))
+        self.assertIsNone(orch.wreck_reason(None))
+        self.assertIsNone(orch.wreck_reason({"battle_writable": None,
+                                             "free_bytes": None, "pids": None}))
+
+    def test_a_pid_count_without_a_limit_never_rules(self):
+        self.assertIsNone(orch.wreck_reason({"battle_writable": True, "pids": 9999,
+                                             "pid_limit": None}))
+
+    def test_ruling_requires_sustained_failure(self):
+        # One bad poll is not a verdict; the streak is what makes it safe.
+        self.assertGreaterEqual(orch.WRECK_CONFIRMATIONS, 2)
+
+    def test_wrecked_is_a_decisive_outcome(self):
+        self.assertIn("wrecked", orch.DECISIVE_OUTCOMES)
+        rated, why = orch.rating_decision("wrecked", {"agent-a": 0, "agent-b": 0},
+                                          {"agent-a": 5, "agent-b": 5})
+        self.assertTrue(rated)

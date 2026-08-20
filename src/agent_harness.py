@@ -148,6 +148,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "stop_reason": STATE["stop_reason"],
                     "commands_run": STATE["commands_run"],
                     "passes": STATE["passes"],
+                    "health": environment_health(),
                     "uptime_seconds": round(time.time() - STARTED_AT, 2),
                 }
             ).encode("utf-8")
@@ -162,6 +163,49 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+
+MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(1 << 20)))
+
+
+def environment_health():
+    """Signals for the "environment wrecked" win condition.
+
+    A false positive here fabricates a kill that never happened, so every signal
+    is an unambiguous hard failure rather than a load measurement - the agents
+    run under --cpus 1.0 and --pids-limit 256, so pressure is normal.
+
+    PID usage comes from the container's own cgroup, NOT from counting /proc:
+    the two agents share a PID namespace, so /proc shows the opponent's
+    processes too and would report one agent's fork bomb against the other.
+    """
+    health = {"battle_writable": None, "free_bytes": None,
+              "pids": None, "pid_limit": None}
+
+    probe = os.path.join(BATTLE_DIR, f".health-{os.getpid()}")
+    try:
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.unlink(probe)
+        health["battle_writable"] = True
+    except OSError:
+        health["battle_writable"] = False
+
+    try:
+        stat = os.statvfs(BATTLE_DIR)
+        health["free_bytes"] = stat.f_bavail * stat.f_frsize
+    except OSError:
+        pass
+
+    try:
+        with open("/sys/fs/cgroup/pids.current") as fh:
+            health["pids"] = int(fh.read().strip())
+        with open("/sys/fs/cgroup/pids.max") as fh:
+            raw = fh.read().strip()
+            health["pid_limit"] = None if raw == "max" else int(raw)
+    except (OSError, ValueError):
+        pass
+    return health
 
 
 def start_heartbeat():

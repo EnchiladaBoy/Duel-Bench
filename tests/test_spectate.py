@@ -216,3 +216,35 @@ class TestFeedTimestamps(unittest.TestCase):
     def test_times_do_not_run_backwards(self):
         times = [e["t"] for e in spectate.snapshot(self.path)["feed"]]
         self.assertEqual(times, sorted(times))
+
+
+class TestNoDuplicatedFeed(unittest.TestCase):
+    """The page is served with its state inlined, and the stream then replays
+    from the beginning - so without a resume point the viewer sees the entire
+    match twice. Found by looking at the rendered page: the second copy was
+    recognisable because the JavaScript adds emoji the Python feed does not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "events.jsonl"
+        write_stream(self.path, EVENTS)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_snapshot_says_where_it_ends(self):
+        self.assertEqual(spectate.snapshot(self.path)["last_seq"],
+                         max(e["seq"] for e in EVENTS))
+
+    def test_the_page_resumes_the_stream_after_the_inlined_state(self):
+        self.assertIn('"/events?from="', spectate.PAGE)
+
+    def test_an_empty_stream_still_reports_a_resume_point(self):
+        empty = Path(self.tmp.name) / "empty.jsonl"
+        empty.write_text("")
+        self.assertEqual(spectate.snapshot(empty)["last_seq"], 0)
+
+    def test_the_bootstrap_feed_has_no_repeats(self):
+        import collections
+        feed = [e["text"] for e in spectate.snapshot(self.path)["feed"]]
+        self.assertEqual([t for t, n in collections.Counter(feed).items() if n > 1], [])

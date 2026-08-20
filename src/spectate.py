@@ -22,6 +22,7 @@ import json
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,13 +61,18 @@ def snapshot(path):
     """Full current state, so a viewer joining mid-match renders immediately
     instead of replaying the whole stream."""
     state = watch.MatchState()
+    last_seq = 0
     for event in read_events(path)[0]:
         state.apply(event)
+        last_seq = max(last_seq, event.get("seq") or 0)
     return {
         "mode": state.mode, "models": state.models, "round": state.round,
         "elapsed": state.elapsed, "bank_granted": state.bank_granted,
         "agents": state.agents, "finished": state.finished,
         "elapsed_at_snapshot": state.elapsed,
+        # Everything up to here is already in the page, so the stream must
+        # resume AFTER it - otherwise the viewer sees the whole match twice.
+        "last_seq": last_seq,
         "feed": [{"t": when, "text": strip_ansi(line)}
                  for when, line in state.feed[-40:]],
     }
@@ -114,6 +120,13 @@ class Spectator(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _since(self):
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        try:
+            return int(urllib.parse.parse_qs(query).get("from", ["0"])[0])
+        except (ValueError, TypeError):
+            return 0
+
     def _stream(self):
         """Server-Sent Events. One connection per viewer; ThreadingHTTPServer
         gives each its own thread."""
@@ -123,10 +136,11 @@ class Spectator(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         try:
+            since = self._since()
             if self.replay:
-                self._stream_replay()
+                self._stream_replay(since)
             else:
-                self._stream_live()
+                self._stream_live(since)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -142,19 +156,23 @@ class Spectator(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
         self.wfile.flush()
 
-    def _stream_replay(self):
+    def _stream_replay(self, since=0):
         events, _ = read_events(self.events_path)
         previous = 0.0
         for event in events:
+            if (event.get("seq") or 0) <= since:
+                continue
             gap = (event.get("t") or 0.0) - previous
             previous = event.get("t") or previous
             if gap > 0 and self.speed > 0:
                 time.sleep(min(gap / self.speed, 3.0))
             self._emit(event)
 
-    def _stream_live(self):
+    def _stream_live(self, since=0):
         events, pos = read_events(self.events_path)
         for event in events:
+            if (event.get("seq") or 0) <= since:
+                continue          # already inlined into the page
             self._emit(event)
         idle_since = time.time()
         while True:
@@ -329,7 +347,7 @@ if(BOOT){
   (BOOT.feed||[]).forEach(e=>note(e.t,e.text));
 }
 render();
-const es=new EventSource("/events");
+const es=new EventSource("/events?from="+((BOOT&&BOOT.last_seq)||0));
 es.onopen=()=>$("conn").textContent="● live";
 es.onmessage=m=>apply(JSON.parse(m.data));
 es.onerror=()=>{$("conn").textContent="○ disconnected"; es.close();};
@@ -370,7 +388,12 @@ def main():
     Spectator.replay = args.replay
     Spectator.speed = args.speed
     # 127.0.0.1, never 0.0.0.0: nothing inside the arena may reach this.
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Spectator)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Spectator)
+    except OSError as exc:
+        sys.exit(f"cannot listen on 127.0.0.1:{args.port}: {exc}\n"
+                 f"Another viewer is probably already running — "
+                 f"open http://127.0.0.1:{args.port}/ or pass --port.")
     server.daemon_threads = True
     url = f"http://127.0.0.1:{args.port}/"
     print(f"{match_dir.name}  ({'replay' if args.replay else 'live'})  ->  {url}", flush=True)

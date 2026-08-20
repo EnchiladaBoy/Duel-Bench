@@ -594,7 +594,7 @@ def heartbeat_state(url, timeout):
 
 def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             control_url, control_token, termination="wall_clock",
-            events=None, roles=None):
+            events=None, roles=None, wreck_observe_only=False):
     """Returns (winner, outcome, reason, duration, detail).
 
     Liveness for both agents is computed from ONE atomic snapshot before any
@@ -609,6 +609,7 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
     last_ok = {name: start for name in containers}
     last_state = {name: None for name in containers}
     wreck_streak = {name: 0 for name in containers}
+    observed_wrecks = {}
     proxy_failures = 0
 
     while time.time() < deadline:
@@ -647,7 +648,16 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
         # it would fabricate a result. Say so and let the ordinary paths resolve.
         if len(wrecked) == 1:
             name, why = next(iter(wrecked.items()))
-            if name not in down:
+            if wreck_observe_only:
+                # Recorded, not ruled. A false positive here fabricates a kill,
+                # and on a published leaderboard that is a permanent wrong entry
+                # - so the signal earns the right to decide only after real
+                # matches show it never trips spuriously.
+                observed_wrecks[(roles or {}).get(name, name)] = why
+                if events:
+                    events.emit("orchestrator", "would_have_wrecked",
+                                agent=(roles or {}).get(name, name), reason=why)
+            elif name not in down:
                 down[name] = ("wrecked", why)
         elif len(wrecked) > 1:
             if events:
@@ -949,6 +959,9 @@ def parse_args():
                    help="network the proxy joins for internet egress")
     p.add_argument("--no-internal-network", action="store_true",
                    help="don't make the battle network --internal (implies --allow-degraded)")
+    p.add_argument("--wreck-observe-only", action="store_true",
+                   help="record environment-wreck signals without letting them "
+                        "decide a match; use until real data shows no false trips")
     p.add_argument("--allow-degraded", action="store_true",
                    help="play the match even if the arena could not be built to spec; "
                         "the result is written with rated=false")
@@ -1220,6 +1233,7 @@ def main():
             [cont_a, cont_b], hb_urls, mode.wall_clock, args.poll_interval,
             args.grace_seconds, control_url, control_token, mode.termination,
             events, {cont_a: "agent-a", cont_b: "agent-b"},
+            args.wreck_observe_only,
         )
     except ArenaError as exc:
         winner, reason = "error", str(exc)

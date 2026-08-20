@@ -111,9 +111,15 @@ def orchestrator_command(entry, args):
     # flag only to the modes it applies to.
     for flag, field, value in (("--time-bank", "time_bank", args.time_bank),
                                ("--max-rounds", "max_rounds", args.max_rounds),
-                               ("--time-limit", "wall_clock", args.time_limit)):
+                               ("--time-limit", "wall_clock", args.time_limit),
+                               ("--max-steps", "max_steps", args.max_steps),
+                               ("--max-requests", "max_requests", args.max_requests)):
         if value is not None and entry["mode"] in modes.OVERRIDE_APPLIES.get(field, ()):
             cmd += [flag, str(value)]
+    if getattr(args, "max_tokens_budget", None) is not None:
+        cmd += ["--max-tokens-budget", str(args.max_tokens_budget)]
+    if getattr(args, "wreck_observe_only", False):
+        cmd.append("--wreck-observe-only")
     cmd += list(getattr(args, "passthrough", []) or [])
     return cmd
 
@@ -224,6 +230,10 @@ def parse_args():
     p.add_argument("--time-bank", type=float, default=None)
     p.add_argument("--max-rounds", type=int, default=None)
     p.add_argument("--time-limit", type=int, default=None)
+    p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--max-requests", type=int, default=None)
+    p.add_argument("--max-tokens-budget", type=int, default=None)
+    p.add_argument("--wreck-observe-only", action="store_true")
     p.add_argument("passthrough", nargs="*", default=[],
                    help="extra flags forwarded to the orchestrator")
     return p.parse_args()

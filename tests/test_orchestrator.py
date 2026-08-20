@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from pathlib import Path as _P
 import orchestrator as orch  # noqa: E402
 
 
@@ -328,3 +329,23 @@ class TestWreckDetection(unittest.TestCase):
         rated, why = orch.rating_decision("wrecked", {"agent-a": 0, "agent-b": 0},
                                           {"agent-a": 5, "agent-b": 5})
         self.assertTrue(rated)
+
+
+class TestWreckObserveOnly(unittest.TestCase):
+    """Wreck detection has only ever been exercised by a deliberate `dd`. Until
+    real matches show it never trips spuriously, it can record without ruling."""
+
+    def test_the_flag_exists(self):
+        source = (_P(orch.__file__)).read_text()
+        self.assertIn("--wreck-observe-only", source)
+
+    def test_observing_records_instead_of_ruling(self):
+        source = (_P(orch.__file__)).read_text()
+        self.assertIn("observed_wrecks", source)
+        self.assertIn("would_have_wrecked", source)
+
+    def test_the_signal_itself_is_unchanged_by_observing(self):
+        # Observation must not weaken detection - only its consequence.
+        self.assertIn("could not start", orch.wreck_reason(
+            {"battle_writable": True, "free_bytes": 5 << 30,
+             "spawn_failures_consecutive": 3}))

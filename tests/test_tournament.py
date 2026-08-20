@@ -112,6 +112,10 @@ class _Args:
     time_bank = 30.0
     max_rounds = 8
     time_limit = 120
+    max_steps = 6
+    max_requests = 30
+    max_tokens_budget = 40000
+    wreck_observe_only = False
     passthrough = []
     match_timeout = 60
 
@@ -150,7 +154,8 @@ class TestOrchestratorCommand(unittest.TestCase):
         for mode in modes.names():
             cmd = self._cmd(mode)
             overrides = {"--max-rounds": "max_rounds", "--time-bank": "time_bank",
-                         "--time-limit": "wall_clock"}
+                         "--time-limit": "wall_clock", "--max-steps": "max_steps",
+                         "--max-requests": "max_requests"}
             for flag, field in overrides.items():
                 if flag in cmd:
                     self.assertIn(mode, modes.OVERRIDE_APPLIES[field],
@@ -183,3 +188,29 @@ class TestRetryHappensInTheSameRun(unittest.TestCase):
         for entry in plan:
             entry.update(status="done", attempts=1)
         self.assertIsNone(self._pick(plan))
+
+
+class TestCapsAndSafetyForwarding(unittest.TestCase):
+    """Cost lives in context growth, so the step cap has to reach every match."""
+
+    def _cmd(self, mode, **over):
+        args = _Args()
+        for k, v in over.items():
+            setattr(args, k, v)
+        return tn.orchestrator_command({"mode": mode, "model_a": "a", "model_b": "b"}, args)
+
+    def test_step_and_request_caps_reach_every_mode(self):
+        for mode in ("untimed", "move-timed", "time-bank", "realtime"):
+            cmd = self._cmd(mode)
+            self.assertIn("--max-steps", cmd, mode)
+            self.assertIn("--max-requests", cmd, mode)
+
+    def test_the_token_budget_is_forwarded(self):
+        self.assertIn("--max-tokens-budget", self._cmd("time-bank"))
+
+    def test_observe_only_is_forwarded_when_set(self):
+        # A false wreck ruling is a permanent wrong entry on a leaderboard, so
+        # the signal must be able to run without deciding anything.
+        self.assertNotIn("--wreck-observe-only", self._cmd("untimed"))
+        self.assertIn("--wreck-observe-only",
+                      self._cmd("untimed", wreck_observe_only=True))

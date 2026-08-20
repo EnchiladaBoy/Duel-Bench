@@ -123,6 +123,14 @@ class Spectator(BaseHTTPRequestHandler):
             pass
 
     def _emit(self, event):
+        # An agent controls its own stdout, so it can echo a record carrying any
+        # payload under its own src. The Python reducer already refuses
+        # arena-only events from the wrong source, but the browser applies this
+        # stream directly - so a forged match_end would end the spectator's
+        # match even though the terminal viewer was immune. Filter here rather
+        # than re-implementing the rule in JavaScript: one place, one rule.
+        if not watch.MatchState.trusted(event.get("event"), event.get("src")):
+            return
         self.wfile.write(f"data: {json.dumps(event)}\n\n".encode("utf-8"))
         self.wfile.flush()
 

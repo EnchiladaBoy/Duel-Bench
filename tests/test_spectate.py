@@ -133,3 +133,46 @@ class TestBinding(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForgedEventsNeverReachTheBrowser(unittest.TestCase):
+    """The Python reducer refuses arena-only events from the wrong source, but
+    the browser applies the SSE stream directly - so a forged match_end would
+    have ended the spectator's match even though the terminal viewer was immune.
+    Filtered server-side so the rule lives in one place, not also in JavaScript.
+    """
+
+    @staticmethod
+    def allowed(event, src):
+        import watch
+        return watch.MatchState.trusted(event, src)
+
+    def test_an_agent_cannot_end_the_browser_match(self):
+        self.assertFalse(self.allowed("match_end", "agent-a"))
+
+    def test_an_agent_cannot_forge_a_kill_or_a_scoreboard(self):
+        for event in ("agent_down", "snapshot", "arena_ready"):
+            self.assertFalse(self.allowed(event, "agent-b"), event)
+
+    def test_an_agent_cannot_forge_proxy_state(self):
+        for event in ("go", "move_start", "bank_exhausted", "barrier_release"):
+            self.assertFalse(self.allowed(event, "agent-a"), event)
+
+    def test_the_arena_is_still_believed(self):
+        self.assertTrue(self.allowed("match_end", "orchestrator"))
+        self.assertTrue(self.allowed("move_start", "proxy"))
+
+    def test_agents_are_still_believed_about_their_own_actions(self):
+        # What an agent DID is exactly what it is entitled to report, and the
+        # feed would be empty without it.
+        for event in ("command_start", "command_result", "pass", "idle"):
+            self.assertTrue(self.allowed(event, "agent-a"), event)
+
+    def test_the_filter_is_applied_on_the_wire(self):
+        source = Path(spectate.__file__).read_text()
+        self.assertIn("watch.MatchState.trusted", source)
+
+    def test_the_rule_is_not_duplicated_in_javascript(self):
+        # Two implementations of the rules is exactly the drift that a single
+        # reducer exists to prevent.
+        self.assertNotIn("ARENA_ONLY", spectate.PAGE)

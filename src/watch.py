@@ -87,8 +87,9 @@ class MatchState:
                   "move_forfeit", "barrier_release", "proxy_start"),
     }
 
-    def trusted(self, kind, src):
-        for owner, kinds in self.ARENA_ONLY.items():
+    @classmethod
+    def trusted(cls, kind, src):
+        for owner, kinds in cls.ARENA_ONLY.items():
             if kind in kinds:
                 return src == owner
         return True

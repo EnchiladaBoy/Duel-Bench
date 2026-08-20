@@ -257,12 +257,31 @@ timestamp is kept as `src_ts` for skew analysis only, and a source cannot forge 
 `src` or `seq`.
 
 ```bash
-tail -f matches/<id>/events.jsonl | python3 -c 'import json,sys
-for l in sys.stdin:
-    d = json.loads(l)
-    print(f"{d[\"t\"]:>7.1f}  {d[\"src\"]:<12} {d[\"event\"]:<14} "
-          f"{d.get(\"command\") or d.get(\"bank_remaining\") or \"\"}")'
+python3 src/watch.py                    # follow the most recent match, live
+python3 src/watch.py matches/<id>       # follow a specific one
+python3 src/watch.py <id> --replay --speed 4
 ```
+
+In a terminal you get a live scoreboard — both agents, their clocks as draining bars,
+what each is running, and a scrolling feed:
+
+```
+ Duel-Bench  time-bank  round 5  7s
+ ────────────────────────────────────────────────────────────────
+  agent-a  openai/gpt-4o-mini      alive  ░░░░░░░░░░░░░░░░░░░░░░    0.0s    3 cmds
+    $ echo a3
+  agent-b  anthropic/claude-haiku  alive  ███████████████████░░░    5.2s    4 cmds
+    $ echo b3
+ ────────────────────────────────────────────────────────────────
+  FIGHT
+  agent-a $ pkill -f '[a]gent_harness.py --agent agent-b'
+  agent-a is out of time
+```
+
+Piped to anything other than a terminal it degrades to a plain scrolling feed, so
+`python3 src/watch.py <id> --replay | less` works too. The viewer is read-only and
+rebuilds its entire picture from the event stream — which is what makes replay, and any
+future UI, possible without touching the arena.
 
 Useful events: `match_start`, `arena_ready`, `go` (the starting gun), `move_start`,
 `thinking` (progress while a model is still reasoning), `command_start`,
@@ -368,15 +387,15 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-166 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+181 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, and the command
 runner. No dependencies, no containers needed.
 
 ## Status
 
 Prototype. Tournaments with side swapping are implemented. Next steps:
-strategy replay/analysis, a live match viewer over events.jsonl, and a
-public leaderboard page.
+strategy analysis, a browser UI over events.jsonl, and a public
+leaderboard page.
 
 ## License
 

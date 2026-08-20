@@ -1394,6 +1394,7 @@ def main():
                 "command_timeout": args.command_timeout,
                 "battle_size": None if args.unbounded_fs else args.battle_size,
                 "read_only_fs": bool(args.read_only_fs and not args.unbounded_fs),
+                "wreck_observe_only": bool(args.wreck_observe_only),
             },
             "exit_codes": exit_codes,
             "commands_run": commands,

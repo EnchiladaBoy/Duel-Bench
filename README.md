@@ -41,7 +41,7 @@ supposed to be adversaries should not have a back-channel.
 |---|---|
 | The opponent's harness process is killed | its container exits |
 | The opponent stops answering | heartbeat silent for `--grace-seconds` |
-| The opponent's environment is unusable | it self-reports a hard failure — cannot fork, cannot write to `/battle`, out of space — sustained across several polls |
+| The opponent's environment is unusable | it self-reports a hard failure — cannot fork, cannot write to `/battle`, out of space — sustained across several polls. `--wreck-observe-only` records the signal without letting it decide, which is worth using until you have data on your own models. |
 | It broke itself | its credential was used far beyond its own turns |
 | Nobody wins | draw, by round cap, spent time banks, or the clock |
 
@@ -340,7 +340,13 @@ Also: `--max-tokens-budget`, `--max-tokens-per-call`, `--temperature`, `--seed`,
 `--command-timeout`, `--memory`, `--cpus`, `--pids-limit`, `--battle-size`,
 `--grace-seconds`, `--poll-interval`, `--startup-timeout`, `--build`, `--keep`,
 `--allow-degraded`, `--no-shuffle-sides`, `--unbounded-fs`, `--no-read-only-fs`,
-`--preflight`.
+`--wreck-observe-only`, `--preflight`.
+
+`tournament.py` takes `--models`, `--modes`, `--games`, `--estimate`, `--run`,
+`--resume`, `--max-total-tokens`, `--mock`, and the same per-match caps
+(`--time-bank`, `--max-rounds`, `--time-limit`, `--max-steps`, `--max-requests`,
+`--max-tokens-budget`, `--wreck-observe-only`), each forwarded only to the modes
+that accept it.
 
 `elo.py` takes `--matches-dir`, `--k`, `--min-games`, `--mode`, `--compare`,
 `--include-degraded`, `--include-mock`, `--include-legacy`, `--quiet`.
@@ -351,19 +357,80 @@ Also: `--max-tokens-budget`, `--max-tokens-per-call`, `--temperature`, `--seed`,
 python3 -m unittest discover -s tests
 ```
 
-293 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+316 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, the sandbox
 properties, real-provider response shapes, and the command runner. No dependencies
 and no containers needed.
 
+## Early results
+
+The first real tournament: two models, three modes, both directions, three games
+each. 18 matches, 17 rated, 125,578 tokens — about **three cents**.
+
+The standings below are cumulative over all 21 rated matches on disk, which also
+include four earlier self-play matches — that is why game counts are uneven
+(a model that plays itself is credited with two games in one match).
+
+```
+=== untimed (8 rated) ===                     === realtime (6 rated) ===
+1  ~deepseek/deepseek-v4-flash-latest  1556   1  ~deepseek/deepseek-v4-flash-latest  1555
+2  inclusionai/ling-3.0-flash          1444   2  inclusionai/ling-3.0-flash          1445
+
+=== time-bank (7 rated) ===
+1  ~deepseek/deepseek-v4-flash-latest  1543
+2  inclusionai/ling-3.0-flash          1457
+```
+
+`~deepseek/deepseek-v4-flash-latest` won every mode. Note how wide the 95%
+confidence intervals still are at this sample size (`elo.py` prints them): they
+overlap, so this is a direction, not a result.
+
+**This does not test the central thesis.** `--compare` returns a Spearman
+correlation of 1.0 for every mode pair, but with only two models there are just
+two possible orderings, so the statistic is degenerate and carries no
+information. Whether the time regime changes who wins needs at least three
+models, ideally with a deliberate speed/capability spread.
+
+### What the modes actually do, which is a real finding
+
+Across 22 real matches, outcomes are strongly mode-dependent:
+
+| mode | kills | mutual destruction | round-cap draws |
+|---|---|---|---|
+| `realtime` | 6 | 0 | 0 |
+| `time-bank` | 3 | **4** | 0 |
+| `untimed` | 5 | 0 | 3 |
+
+(One further `untimed` match ended in `arena_error` and is excluded — non-contest
+outcomes are never rated.)
+
+In lockstep modes both agents commit a kill in the **same round** and execute
+simultaneously, so they destroy each other — 57% of time-bank matches ended that
+way. In realtime one strikes first and every match was decisive.
+
+The practical consequence: **lockstep modes are noisier than they look.** More
+than half of those matches contribute 0.5/0.5 and carry little ranking signal, so
+they need more games than realtime to separate two models.
+
+A likely cause is the system prompt, which tells both agents exactly how to
+identify and kill each other — the shared PID namespace, the command-line
+pattern, both heartbeat URLs. It makes matches decisive fast, but both models
+converge on `kill -9 <pid>` within two turns, which may leave little room for
+strategy.
+
+Wreck detection has **never once ruled a match**: no real match has ended in
+`wrecked`. That is the kind of evidence it needs before being trusted to decide
+one — with the caveat that the match record did not, until now, state whether the
+detector was even allowed to rule. `result.json` now records
+`arena.wreck_observe_only`, so a future "it never fired" is a claim you can check
+rather than take on faith.
+
 ## Status
 
-Working prototype, verified against real models. Every mechanism is built and
-tested; what it has **not** yet done is measure anything — every real match so far
-has been one model against itself.
-
-Next: a real multi-model tournament to produce the first comparative leaderboard,
-and a public leaderboard page.
+Working prototype, verified end to end against real models and producing real
+leaderboards. Next: a third model with a real speed/capability gap, which is the
+only way to get a cross-mode correlation that means anything, and a public
+leaderboard page.
 
 ## License
 

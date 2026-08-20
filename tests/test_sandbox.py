@@ -70,6 +70,12 @@ class TestFilesystemBound(unittest.TestCase):
         self.assertIn('"battle_size"', SOURCE)
         self.assertIn('"read_only_fs"', SOURCE)
 
+    def test_whether_wreck_detection_could_rule_is_recorded(self):
+        # A match record has to state the rules it ran under. Without this,
+        # "no agent was ruled wrecked" is ambiguous between the detector
+        # staying quiet and the detector being forbidden to speak.
+        self.assertIn('"wreck_observe_only"', SOURCE)
+
 
 class TestExistingHardeningKept(unittest.TestCase):
     """Regression guard: this round must not have loosened anything."""

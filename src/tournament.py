@@ -20,6 +20,8 @@ import json
 import re
 import subprocess
 import sys
+
+import modes
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,8 +92,8 @@ def estimate(plan, matches_dir=MATCHES):
           "--max-total-tokens to bound the spend.")
 
 
-def run_match(entry, args):
-    """Invoke the orchestrator for one scheduled match."""
+def orchestrator_command(entry, args):
+    """Build the orchestrator invocation for one scheduled match."""
     cmd = [
         sys.executable, str(ORCHESTRATOR),
         "--mode", entry["mode"],
@@ -103,13 +105,22 @@ def run_match(entry, args):
     ]
     if args.mock:
         cmd.append("--mock")
-    for flag, value in (("--time-bank", args.time_bank),
-                        ("--max-rounds", args.max_rounds),
-                        ("--time-limit", args.time_limit)):
-        if value is not None:
+    # The orchestrator rejects an override that has no meaning in the chosen
+    # mode - deliberately, since silently ignoring flags is how benchmark
+    # configs rot. A tournament spans several modes, so it must forward each
+    # flag only to the modes it applies to.
+    for flag, field, value in (("--time-bank", "time_bank", args.time_bank),
+                               ("--max-rounds", "max_rounds", args.max_rounds),
+                               ("--time-limit", "wall_clock", args.time_limit)):
+        if value is not None and entry["mode"] in modes.OVERRIDE_APPLIES.get(field, ()):
             cmd += [flag, str(value)]
-    cmd += args.passthrough
+    cmd += list(getattr(args, "passthrough", []) or [])
+    return cmd
 
+
+def run_match(entry, args):
+    """Invoke the orchestrator for one scheduled match."""
+    cmd = orchestrator_command(entry, args)
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.match_timeout)
     found = LOGS_RE.search(proc.stdout or "")
     if not found:
@@ -130,15 +141,22 @@ def run(manifest_path, manifest, args):
     spent = sum(m["total_tokens"] for m in plan)
     done = sum(1 for m in plan if m["status"] in ("done", "failed"))
 
-    for entry in plan:
-        if entry["status"] == "done":
-            continue
-        if entry["status"] == "failed" and entry["attempts"] > 1:
-            continue
+    def next_entry():
+        # A retry must happen in THIS run: a for-loop over the plan has already
+        # passed the failed entry by the time it is set back to pending, so the
+        # retry would silently wait for the next --resume.
+        return next((e for e in plan
+                     if e["status"] == "pending" and e["attempts"] <= 1), None)
+
+    while True:
+        entry = next_entry()
+        if entry is None:
+            break
         if args.max_total_tokens and spent >= args.max_total_tokens:
             print(f"\n[budget] stopping: {spent:,} tokens spent, cap is "
                   f"{args.max_total_tokens:,}. Re-run with --resume to continue.")
             break
+
 
         done += 1
         entry["attempts"] += 1

@@ -105,3 +105,81 @@ class TestResumeSemantics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Args:
+    mock = True
+    time_bank = 30.0
+    max_rounds = 8
+    time_limit = 120
+    passthrough = []
+    match_timeout = 60
+
+
+class TestOrchestratorCommand(unittest.TestCase):
+    def _cmd(self, mode):
+        entry = {"mode": mode, "model_a": "a", "model_b": "b"}
+        return tn.orchestrator_command(entry, _Args())
+
+    def test_sides_are_never_re_randomised(self):
+        """The tournament assigns sides deliberately, one pairing each way. If
+        the orchestrator reshuffled them the balance would be destroyed."""
+        self.assertIn("--no-shuffle-sides", self._cmd("untimed"))
+
+    def test_a_flag_is_only_sent_to_modes_where_it_applies(self):
+        # The orchestrator REJECTS a meaningless override rather than ignoring
+        # it, so forwarding --max-rounds to realtime fails the whole match.
+        self.assertNotIn("--max-rounds", self._cmd("realtime"))
+        self.assertIn("--max-rounds", self._cmd("untimed"))
+
+    def test_time_bank_only_goes_to_time_bank(self):
+        self.assertIn("--time-bank", self._cmd("time-bank"))
+        for mode in ("untimed", "move-timed", "realtime"):
+            self.assertNotIn("--time-bank", self._cmd(mode), mode)
+
+    def test_the_mode_and_both_models_are_always_passed(self):
+        cmd = self._cmd("time-bank")
+        self.assertEqual(cmd[cmd.index("--mode") + 1], "time-bank")
+        self.assertEqual(cmd[cmd.index("--model-a") + 1], "a")
+        self.assertEqual(cmd[cmd.index("--model-b") + 1], "b")
+
+    def test_every_forwarded_flag_is_accepted_by_every_mode_it_is_sent_to(self):
+        # The guarantee that matters: a multi-mode tournament must never build
+        # an invocation the orchestrator will reject.
+        import modes
+        for mode in modes.names():
+            cmd = self._cmd(mode)
+            overrides = {"--max-rounds": "max_rounds", "--time-bank": "time_bank",
+                         "--time-limit": "wall_clock"}
+            for flag, field in overrides.items():
+                if flag in cmd:
+                    self.assertIn(mode, modes.OVERRIDE_APPLIES[field],
+                                  f"{flag} sent to {mode}, which rejects it")
+
+
+class TestRetryHappensInTheSameRun(unittest.TestCase):
+    """A for-loop over the plan has already passed a failed entry by the time it
+    is set back to pending, so the retry would silently wait for --resume."""
+
+    @staticmethod
+    def _pick(plan):
+        return next((e for e in plan
+                     if e["status"] == "pending" and e["attempts"] <= 1), None)
+
+    def test_a_once_failed_entry_is_picked_up_again(self):
+        plan = tn.schedule(["a", "b"], ["untimed"], games=1)
+        plan[0].update(status="pending", attempts=1)     # failed once
+        plan[1].update(status="done", attempts=1)
+        self.assertIs(self._pick(plan), plan[0])
+
+    def test_a_twice_failed_entry_is_abandoned(self):
+        plan = tn.schedule(["a", "b"], ["untimed"], games=1)
+        plan[0].update(status="failed", attempts=2)
+        plan[1].update(status="done", attempts=1)
+        self.assertIsNone(self._pick(plan))
+
+    def test_a_finished_plan_selects_nothing(self):
+        plan = tn.schedule(["a", "b"], ["untimed"], games=1)
+        for entry in plan:
+            entry.update(status="done", attempts=1)
+        self.assertIsNone(self._pick(plan))

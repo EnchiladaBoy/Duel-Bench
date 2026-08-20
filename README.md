@@ -387,7 +387,7 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-181 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+189 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, and the command
 runner. No dependencies, no containers needed.
 

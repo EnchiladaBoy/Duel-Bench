@@ -15,8 +15,11 @@ Nothing served by this process ever echoes a bearer token: agents are
 identified to each other, and in the logs, by role name only.
 """
 
+import http.client
 import json
 import os
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -89,6 +92,86 @@ _LOG_FH = None
 # (n, temperature, reasoning, provider, transforms, logit_bias, ...) is dropped
 # so both agents are always sampled under identical arena settings.
 ALLOWED_BODY_KEYS = ("messages", "tools", "tool_choice")
+
+
+def resolvers():
+    """Nameservers actually in effect inside this container."""
+    found = []
+    try:
+        with open("/etc/resolv.conf", "r") as fh:
+            for line in fh:
+                if line.startswith("nameserver"):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        found.append(parts[1])
+    except OSError:
+        pass
+    return found
+
+
+def egress_report(timeout=8.0):
+    """Prove - from inside the proxy container, in its real network topology -
+    that openrouter.ai is reachable, and name the stage that fails if not.
+
+    The battle network is --internal and the proxy is hot-attached to an egress
+    network afterwards; a host-side curl proves nothing about either. The one
+    historical real match died at exactly the first stage here and its logs
+    recorded only a repeated 502.
+    """
+    parsed = urllib.parse.urlparse(OPENROUTER_URL)
+    host, port = parsed.hostname, parsed.port or 443
+    report = {"host": host, "resolvers": resolvers()}
+
+    started = time.monotonic()
+    try:
+        addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception as exc:
+        report.update(ok=False, stage="dns", errno=getattr(exc, "errno", None),
+                      error=_redact(f"{type(exc).__name__}: {exc}"))
+        return report
+    report["dns_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    started = time.monotonic()
+    sock = None
+    try:
+        sock = socket.create_connection(addresses[0][4], timeout=timeout)
+    except Exception as exc:
+        report.update(ok=False, stage="tcp", errno=getattr(exc, "errno", None),
+                      error=_redact(f"{type(exc).__name__}: {exc}"))
+        return report
+    report["tcp_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    started = time.monotonic()
+    try:
+        wrapped = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    except Exception as exc:
+        sock.close()
+        report.update(ok=False, stage="tls",
+                      error=_redact(f"{type(exc).__name__}: {exc}"))
+        return report
+    report["tls_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    # GET /api/v1/key: validates the key and costs zero tokens.
+    started = time.monotonic()
+    try:
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        conn.sock = wrapped
+        conn.request("GET", "/api/v1/key", headers={
+            "Authorization": f"Bearer {API_KEY}", "Accept": "application/json"})
+        answer = conn.getresponse()
+        report["key_check_status"] = answer.status
+        answer.read()
+        conn.close()
+    except Exception as exc:
+        report.update(ok=False, stage="http",
+                      error=_redact(f"{type(exc).__name__}: {exc}"))
+        return report
+    report["key_ms"] = round((time.monotonic() - started) * 1000, 1)
+    report["ok"] = report["key_check_status"] == 200
+    if not report["ok"]:
+        # 401 bad key, 402 out of credit - both are far cheaper to learn here.
+        report["stage"] = "auth"
+    return report
 
 
 def _redact(text):
@@ -534,6 +617,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # signal about the opponent.
             send_json(self, 200, {"status": "ok", "mock": MOCK,
                                   "agents": len(TOKENS), "lockstep": LOCKSTEP})
+            return
+
+        if self.path == "/control/egress":
+            # Control-gated: an agent must never be able to ask whether the
+            # arena has egress, nor use this to probe arbitrary hosts.
+            if not self._is_control():
+                send_json(self, 401, {"error": "control token required"})
+                return
+            report = egress_report()
+            log({"event": "egress_check", **report})
+            send_json(self, 200 if report.get("ok") else 503, report)
             return
 
         if self.path == "/control/status":

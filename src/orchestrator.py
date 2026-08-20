@@ -423,7 +423,15 @@ def start_proxy(name, network, egress_network, image, env_file, log_dir,
     ]
     run_cmd(cmd)
     if egress_network:
-        run_cmd([PODMAN, "network", "connect", egress_network, name], check=False)
+        res = run_cmd([PODMAN, "network", "connect", egress_network, name], check=False)
+        if res.returncode != 0:
+            # This used to fail in complete silence. The proxy's /health still
+            # answers, agents still start, and every model call then dies on DNS
+            # - which is exactly how the one historical real match was lost.
+            print(f"[net] WARNING could not attach egress network "
+                  f"{egress_network!r}: {res.stderr.strip()}", flush=True)
+            return False
+    return True
 
 
 def start_agent(name, pod, image, role, opponent, token_file, model,
@@ -468,7 +476,7 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
     run_cmd(cmd)
 
 
-def control_status(url, token, timeout=3):
+def control_get(url, token, timeout=3):
     """Authoritative match state, straight from the proxy.
 
     Preferred over the agents' heartbeat self-reports: both agents share a
@@ -515,7 +523,7 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
     while time.time() < deadline:
         loop_start = time.time()
         states = inspect_containers(containers)
-        status = control_status(control_url, control_token) if control_url else {}
+        status = control_get(control_url, control_token) if control_url else {}
         now = time.time()
 
         down = {}
@@ -705,6 +713,74 @@ def teardown(resources, keep=False):
               f"and {PODMAN} network ls --filter name=admatch-", flush=True)
 
 
+def preflight(args, image):
+    """Verify the arena can reach the model API, in its real network topology.
+
+    Creates the network and the proxy and nothing else - no pod, no agents - so
+    it cannot spend anything. A host-side curl would prove nothing: the battle
+    network is --internal and the proxy is hot-attached to an egress network
+    afterwards, so only a probe from inside that container is meaningful."""
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        sys.exit("OPENROUTER_API_KEY is not set (preflight checks the real API path)")
+
+    stamp = utc_now().strftime("%Y%m%d-%H%M%SZ")
+    work = MATCHES / f"preflight-{stamp}"
+    (work / "proxy").mkdir(parents=True, exist_ok=True)
+    net_name = f"admatch-pre-{stamp}"
+    proxy_name = f"admatch-proxy-pre-{stamp}"
+    control_token = secrets.token_hex(16)
+    token = secrets.token_hex(16)
+    host_port = get_free_port()
+
+    secret_dir = Path(tempfile.mkdtemp(prefix="admatch-pre-", suffix="-secrets"))
+    os.chmod(secret_dir, 0o700)
+    env_file = secret_dir / "proxy.env"
+    fd = os.open(env_file, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write("\n".join([
+            f"TOKENS_JSON={json.dumps({token: args.model_a}, separators=(',', ':'))}",
+            f"ROLES_JSON={json.dumps({token: 'agent-a'}, separators=(',', ':'))}",
+            f"CONTROL_TOKEN={control_token}",
+            f"OPENROUTER_API_KEY={api_key}",
+            "MOCK_BACKEND=0",
+            "PROXY_LOG=/logs/proxy.jsonl",
+            f"PROXY_PORT={PROXY_CONTAINER_PORT}",
+        ] + [f"{k}={v}" for k, v in modes.to_env(modes.resolve("realtime")).items()]) + "\n")
+
+    resources = {"containers": [], "pod": None, "network": None}
+    verdict = 1
+    try:
+        create_network(net_name, internal=not args.no_internal_network)
+        resources["network"] = net_name
+        start_proxy(proxy_name, net_name, args.egress_network, image,
+                    env_file, work / "proxy", work, host_port)
+        resources["containers"].append(proxy_name)
+        if not wait_http(f"http://127.0.0.1:{host_port}/health", timeout=args.startup_timeout):
+            print("[preflight] FAIL: the proxy never became ready", file=sys.stderr)
+            return 1
+        report = control_get(f"http://127.0.0.1:{host_port}/control/egress",
+                             control_token, timeout=30) or {}
+        print(json.dumps(report, indent=2))
+        if report.get("ok"):
+            print(f"\n[preflight] OK — the proxy container reached {report.get('host')}: "
+                  f"dns {report.get('dns_ms')}ms, tcp {report.get('tcp_ms')}ms, "
+                  f"tls {report.get('tls_ms')}ms, key check "
+                  f"{report.get('key_check_status')}", flush=True)
+            verdict = 0
+        else:
+            print(f"\n[preflight] FAIL at stage {report.get('stage')!r}: "
+                  f"{report.get('error')}", file=sys.stderr, flush=True)
+    finally:
+        env_file.unlink(missing_ok=True)
+        try:
+            secret_dir.rmdir()
+        except OSError:
+            pass
+        teardown(resources, keep=False)
+    return verdict
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="agent-deathmatch orchestrator")
     p.add_argument("--model-a", default="mock/agent-a")
@@ -748,6 +824,9 @@ def parse_args():
     p.add_argument("--grace-seconds", type=float, default=10.0,
                    help="seconds a heartbeat may be silent before the agent is declared down")
     p.add_argument("--startup-timeout", type=int, default=90)
+    p.add_argument("--preflight", action="store_true",
+                   help="verify the proxy container can reach the model API, then exit; "
+                        "creates no pod and no agents, so it cannot spend anything")
     p.add_argument("--build", action="store_true", help="force rebuild of the image")
     p.add_argument("--keep", action="store_true", help="don't tear down after the match")
     p.add_argument("--no-shuffle-sides", action="store_true",
@@ -808,6 +887,9 @@ def main():
 
     image = args.image or image_tag_for(CONTAINERFILE)
     image_id = ensure_image(image, force_build=args.build)
+
+    if args.preflight:
+        return preflight(args, image)
 
     started_utc = utc_now()
     match_id = started_utc.strftime("%Y%m%d-%H%M%SZ") + "-" + secrets.token_hex(4)
@@ -949,6 +1031,21 @@ def main():
                 f"model proxy did not become ready in {args.startup_timeout}s; "
                 f"agents would have burned their retry budget against it")
 
+        if not args.mock:
+            # Refuse in three seconds rather than discovering it as 15 model
+            # errors, zero commands and a meaningless draw - which is what the
+            # one historical real match cost.
+            report = control_get(f"http://127.0.0.1:{proxy_host_port}/control/egress",
+                                 control_token, timeout=30) or {}
+            events.emit("orchestrator", "egress_check", **report)
+            if not report.get("ok"):
+                raise ArenaError(
+                    f"the proxy container cannot reach the model API "
+                    f"(stage: {report.get('stage')}): {report.get('error')}. "
+                    f"Run --preflight to diagnose; nothing was spent.")
+            print(f"[net] egress verified: dns {report.get('dns_ms')}ms, "
+                  f"tls {report.get('tls_ms')}ms", flush=True)
+
         # Both containers are created before either heartbeat is awaited, so
         # agent-a does not get a head start proportional to agent-b's startup.
         start_agent(cont_a, pod_name, image, "agent-a", "agent-b",
@@ -1024,7 +1121,7 @@ def main():
         final = {}
         if control_url and proxy_name in resources["containers"]:
             # Must happen before teardown removes the proxy container.
-            final = control_status(control_url, control_token) or {}
+            final = control_get(control_url, control_token) or {}
         if mode.time_bank is not None:
             for role, left in (final.get("banks") or {}).items():
                 if left is None:

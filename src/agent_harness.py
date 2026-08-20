@@ -256,6 +256,53 @@ def parse_fenced_command(text):
     return None
 
 
+def coerce_content(content):
+    """Flatten a message's content to a string.
+
+    Providers - reasoning models especially - return content as a LIST of typed
+    parts. A list is truthy, so it used to reach the fence regex and raise
+    TypeError straight out of main(), killing the container and handing the
+    opponent a rated kill over a serialisation difference."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def unanswered_tool_replies(assistant_message, answered_id, step):
+    """A tool reply for every tool_call we are NOT executing.
+
+    An OpenAI-compatible endpoint requires one `tool` message per tool_call_id.
+    Models routinely emit two or three calls despite being told to issue one -
+    the system prompt is a request, not a constraint - and a single unanswered
+    id makes every subsequent request 400 for the rest of the match."""
+    replies = []
+    for index, call in enumerate(assistant_message.get("tool_calls") or []):
+        call_id = call.get("id")
+        if not call_id or call_id == answered_id:
+            continue
+        replies.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": json.dumps({
+                "ignored": "one run_bash command per turn; only the first was executed",
+                "step": step,
+            }),
+        })
+    return replies
+
+
 def normalize_assistant_message(message):
     out = {"role": "assistant"}
     content = message.get("content")
@@ -290,7 +337,14 @@ def extract_command(response):
             try:
                 args = json.loads(raw_args)
             except json.JSONDecodeError:
-                args = {"command": raw_args}
+                text = raw_args if isinstance(raw_args, str) else ""
+                if text.lstrip()[:1] in ("{", "["):
+                    # It was MEANT to be JSON and did not parse, so it is
+                    # truncated - almost always by the max_tokens cap. Running
+                    # the fragment would hand a partial command to bash -c.
+                    return {"kind": "error", "error": "truncated tool arguments",
+                            "truncated": True, "raw": text[:200]}
+                args = {"command": text}
         # Models legitimately emit `arguments` as a bare string/list/number.
         # json.loads succeeds, and .get() on the result would raise
         # AttributeError straight out of main(), killing the container and
@@ -313,7 +367,7 @@ def extract_command(response):
                 "command": command,
             }
 
-    content = message.get("content") or ""
+    content = coerce_content(message.get("content"))
     command = parse_fenced_command(content)
     if command:
         return {"kind": "fence", "message": message, "command": command}
@@ -589,6 +643,9 @@ def main():
         if isinstance(arena, dict):
             STATE["arena"] = arena
         action = extract_command(response)
+        choice = ((response.get("choices") or [{}])[0]
+                  if isinstance(response, dict) else {})
+        message = choice.get("message") or {}
         log(
             "model_response",
             {
@@ -596,6 +653,13 @@ def main():
                 "action_kind": action.get("kind"),
                 "command": action.get("command"),
                 "content": action.get("content"),
+                # Without these a truncated reply is indistinguishable from a
+                # model that simply chose not to act.
+                "finish_reason": choice.get("finish_reason"),
+                "tool_call_count": len(message.get("tool_calls") or []),
+                "content_type": type(message.get("content")).__name__,
+                "truncated": bool(action.get("truncated")
+                                  or choice.get("finish_reason") == "length"),
             },
         )
 
@@ -626,7 +690,11 @@ def main():
             log("pass", {"step": step, "content": action.get("content"),
                          "passes": STATE["passes"]})
             if action.get("message"):
-                messages.append(normalize_assistant_message(action["message"]))
+                assistant = normalize_assistant_message(action["message"])
+                messages.append(assistant)
+                # Same invariant: an unusable tool call still carries an id that
+                # must be answered.
+                messages.extend(unanswered_tool_replies(assistant, None, step))
             messages.append(
                 {
                     "role": "user",
@@ -678,13 +746,18 @@ def main():
         clock = format_clock(arena)
         if action["kind"] == "tool_call":
             content = json.dumps(result, ensure_ascii=False)
+            answered = action.get("tool_call_id") or f"call_{step}"
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": action.get("tool_call_id") or f"call_{step}",
+                    "tool_call_id": answered,
                     "content": content + ("\n" + clock if clock else ""),
                 }
             )
+            # A model may have emitted several calls; every id needs a reply or
+            # the transcript is invalid from here on.
+            messages.extend(unanswered_tool_replies(
+                messages[-2] if len(messages) >= 2 else {}, answered, step))
         else:
             messages.append(
                 {

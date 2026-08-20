@@ -91,6 +91,20 @@ _LOG_FH = None
 ALLOWED_BODY_KEYS = ("messages", "tools", "tool_choice")
 
 
+def _redact(text):
+    """Strip every secret this process holds out of a string.
+
+    The precondition for logging upstream error bodies at all: the old proxy
+    leaked raw agent tokens into proxy.jsonl, and diagnostics must not
+    reintroduce that."""
+    if not isinstance(text, str):
+        text = str(text)
+    for secret in [API_KEY, CONTROL_TOKEN, *TOKENS]:
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
 def role_of(token):
     return ROLES.get(token, "unknown")
 
@@ -411,9 +425,25 @@ def forward_openrouter(body, model, timeout=None):
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout or UPSTREAM_TIMEOUT) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+            body = json.loads(response.read().decode("utf-8"))
+            choices = body.get("choices") if isinstance(body, dict) else None
+            if not (isinstance(choices, list) and choices):
+                # OpenRouter answers 200 with a body-level error when a provider
+                # fails AFTER accepting the request. Trusting the status charges
+                # the time bank and turns a provider outage into a rated
+                # protocol forfeit - the model blamed for the network.
+                err = (body.get("error") or {}) if isinstance(body, dict) else {}
+                return 503, {
+                    "error": _redact(err.get("message") or "upstream returned no choices")[:500],
+                    "error_kind": "upstream",
+                    "upstream_status": err.get("code"),
+                    "provider": body.get("provider") if isinstance(body, dict) else None,
+                    "generation_id": body.get("id") if isinstance(body, dict) else None,
+                    "stage": "decode",
+                }
+            return response.status, body
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode(errors="replace")
+        raw = _redact(exc.read().decode(errors="replace"))
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -425,11 +455,22 @@ def forward_openrouter(body, model, timeout=None):
         status = 503 if exc.code in (429, 500, 502, 503, 504) else exc.code
         parsed["error_kind"] = "upstream"
         parsed["upstream_status"] = exc.code
+        parsed["stage"] = "http"
         return status, parsed
     except Exception as exc:
+        # Distinguish "DNS is broken" from "TLS failed" from "the socket timed
+        # out". The one historical real failure was a getaddrinfo error and the
+        # logs recorded nothing but a repeated 502.
+        name = type(exc).__name__
+        stage = {"gaierror": "dns", "SSLError": "tls", "SSLCertVerificationError": "tls",
+                 "timeout": "timeout", "ConnectionRefusedError": "tcp"}.get(name)
+        if stage is None:
+            stage = "dns" if "Name or service not known" in str(exc) else "connect"
         return 503, {
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _redact(f"{name}: {exc}")[:500],
             "error_kind": "upstream",
+            "stage": stage,
+            "errno": getattr(exc, "errno", None),
         }
 
 
@@ -520,8 +561,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             terminal = None
             if MODE.termination == "banks" and all_spent:
                 terminal = "banks_exhausted"
-            elif (MODE.termination == "rounds" and MODE.max_rounds
-                    and round_no > MODE.max_rounds):
+            elif MODE.max_rounds and round_no > MODE.max_rounds:
                 terminal = "rounds_complete"
             send_json(self, 200, {
                 "mode": MODE.name,
@@ -605,7 +645,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # The proxy ENFORCES the round cap. Leaving it to the orchestrator's
         # poll would hand whichever agent asked first a bonus move, and "equal
         # turns each" would quietly stop being true.
-        if MODE.termination == "rounds" and MODE.max_rounds:
+        # Enforced wherever a cap exists, not only where rounds are the
+        # TERMINATION rule - otherwise --max-rounds is accepted in time-bank and
+        # silently enforces nothing, which is a safety cap that does not exist.
+        if MODE.max_rounds:
             with BARRIER_COND:
                 past_cap = barrier["round"] > MODE.max_rounds
             if past_cap:

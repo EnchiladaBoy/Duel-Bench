@@ -530,6 +530,10 @@ def main():
                         kind = json.loads(body).get("error_kind")
                     except (json.JSONDecodeError, AttributeError):
                         kind = None
+                    if kind == "rounds_complete":
+                        # Every round played. A legitimate end of play, so the
+                        # agent stays alive and killable to the last moment.
+                        idle("rounds_complete")
                     if kind == "time_bank_exhausted":
                         # Out of thinking time is a GAME outcome, not an
                         # infrastructure failure: stay alive, stay killable,
@@ -609,12 +613,14 @@ def main():
         command = action["command"]
         STATE["last_command"] = command
 
+        forfeited = False
         if LOCKSTEP:
-            # Fair mode: commit this move at the barrier, then wait until the
-            # opponent has also committed (or the round deadline passes) so both
-            # commands start together regardless of model latency.
+            # Commit this move at the barrier, then wait until the opponent has
+            # also committed (or the round deadline passes) so both commands
+            # start together regardless of model latency.
             try:
                 join_info = barrier_join()
+                forfeited = bool(join_info.get("forfeit"))
                 release = barrier_wait(join_info.get("round", 0))
                 log(
                     "barrier",
@@ -623,6 +629,7 @@ def main():
                         "round": release.get("round"),
                         "both_joined": release.get("both"),
                         "joined": release.get("joined"),
+                        "forfeit": forfeited,
                     },
                 )
             except Exception as exc:
@@ -630,6 +637,25 @@ def main():
                     "barrier_error",
                     {"step": step, "error": f"{type(exc).__name__}: {exc}"},
                 )
+
+        if forfeited:
+            # Too slow for this mode's deadline: the round is lost, the command
+            # does not run. The transcript still needs a reply for the tool call
+            # that was already appended, or every later request 400s upstream.
+            log("move_forfeit", {"step": step, "command": command})
+            notice = (f"You exceeded the {ROUND_TIMEOUT:.0f}s move deadline, so this "
+                      f"round was forfeited and your command did not run. "
+                      f"Your opponent acted. Decide faster.")
+            if action["kind"] == "tool_call":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": action.get("tool_call_id") or f"call_{step}",
+                    "content": json.dumps({"forfeited": True, "reason": notice}),
+                })
+            else:
+                messages.append({"role": "user", "content": notice})
+            messages = trim_messages(messages)
+            continue
 
         log("command_start", {"step": step, "command": command})
 

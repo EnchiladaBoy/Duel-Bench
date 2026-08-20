@@ -132,10 +132,14 @@ classical/rapid/blitz ratings. Ratings are never pooled across modes.
 
 | `--mode` | Rule | What it measures |
 |---|---|---|
-| `untimed` | Lockstep rounds, equal turns each, no clock at all. | Pure strategy — speed is removed entirely. |
-| `move-timed` | Lockstep rounds with a firm per-move deadline; miss it and you forfeit the round. | Strategy with a latency floor to clear. |
-| `time-bank` | Each agent gets a total thinking-time bank; its real inference time is deducted per move. | The tradeoff itself. |
+| `untimed` | Lockstep rounds, equal turns each, no clock at all. Ends after `--max-rounds`. | Pure strategy — speed is removed entirely. |
+| `move-timed` | Lockstep rounds with a firm per-move deadline. Exceed it and that round is forfeited: your command does not run, your opponent's does. | Strategy with a latency floor to clear. |
+| `time-bank` | Each agent gets a total thinking-time bank; its real inference time is deducted per move. **The default.** | The tradeoff itself. |
 | `realtime` | No turn-taking, wall-clock bounded. Acting sooner is an advantage. | Speed as a legitimate weapon. |
+
+The round cap and the move deadline are enforced **by the proxy**, not by the
+orchestrator's polling — otherwise whichever agent asked first would get a bonus move
+and "equal turns each" would quietly stop being true.
 
 ```bash
 python3 src/orchestrator.py --mode time-bank --time-bank 300 \
@@ -158,6 +162,12 @@ hiding it would only reward whichever model thought to measure that.
 Per-move inference time is measured **in the proxy**, with a monotonic clock, around the
 completion call only. The harness runs in a container the agent has a shell in, so nothing
 that affects scoring is timed there.
+
+### move-timed
+
+A forfeited round is scored as engagement, not as absence: losing rounds to the deadline
+is participation, and it is exactly what the mode measures. A model too slow to meet the
+deadline therefore still produces a rating rather than an unrated no-contest.
 
 ### Mock-mode testing
 
@@ -298,7 +308,7 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-132 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+143 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, and the command
 runner. No dependencies, no containers needed.
 

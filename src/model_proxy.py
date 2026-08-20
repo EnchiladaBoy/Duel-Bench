@@ -69,6 +69,11 @@ TOKEN_USAGE = {token: 0 for token in TOKENS}
 # punished for having a slow opponent.
 BANK_REMAINING = {token: MODE.time_bank for token in TOKENS}
 MOVE_SECONDS = {token: [] for token in TOKENS}
+# How long the move an agent is about to commit actually took it to produce.
+# Measuring the agent's OWN latency is what makes a deadline about your speed
+# rather than about who happened to think second.
+LAST_MOVE_SECONDS = {token: None for token in TOKENS}
+FORFEITS = {token: 0 for token in TOKENS}
 # Mutated and read under LOCK only, so the exhaustion test is atomic with the
 # charge. Barrier retirement happens separately, outside LOCK.
 EXHAUSTED = set()
@@ -111,6 +116,13 @@ def log(record):
 # --------------------------------------------------------------- lockstep
 
 BARRIER_COND = threading.Condition()
+
+
+def reset_move_state():
+    """Test helper: clear per-move state without touching the barrier."""
+    for token in TOKENS:
+        LAST_MOVE_SECONDS[token] = None
+        FORFEITS[token] = 0
 
 
 def initial_barrier_state():
@@ -168,6 +180,16 @@ def barrier_join(token):
     """Commit this agent's move for the current round."""
     with BARRIER_COND:
         round_no = barrier["round"]
+        # A move that took longer than the deadline forfeits this round: the
+        # agent still JOINS, so the round releases normally and its opponent is
+        # not stalled, but the move does not execute.
+        forfeit = False
+        if MODE.deadline_effect == "forfeit" and MODE.move_deadline:
+            last = LAST_MOVE_SECONDS.get(token)
+            if last is not None and last > MODE.move_deadline:
+                forfeit = True
+                with LOCK:
+                    FORFEITS[token] += 1
         barrier["joined"].add(token)
         # A merely-absent agent rejoins the quorum; an agent whose time bank is
         # spent does not, or it would stall the survivor every round forever.
@@ -179,12 +201,17 @@ def barrier_join(token):
         # An empty active set means every agent has retired (all banks spent).
         # Short-circuiting to False there would leave a round that BOTH agents
         # joined permanently unreleased, stalling them for a full deadline.
+        if forfeit:
+            log({"event": "move_forfeit", "agent": role_of(token), "round": round_no,
+                 "took": round(LAST_MOVE_SECONDS[token], 2),
+                 "deadline": MODE.move_deadline})
         if barrier["joined"] >= barrier["active"]:
             record = _release_unlocked(complete=bool(barrier["active"]))
-            return {"round": round_no, "released": True, **record}
+            return {"round": round_no, "released": True, "forfeit": forfeit, **record}
         return {
             "round": round_no,
             "released": False,
+            "forfeit": forfeit,
             "joined": sorted(role_of(t) for t in barrier["joined"]),
         }
 
@@ -493,6 +520,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             terminal = None
             if MODE.termination == "banks" and all_spent:
                 terminal = "banks_exhausted"
+            elif (MODE.termination == "rounds" and MODE.max_rounds
+                    and round_no > MODE.max_rounds):
+                terminal = "rounds_complete"
             send_json(self, 200, {
                 "mode": MODE.name,
                 "round": round_no,
@@ -501,6 +531,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "banks": banks,
                 "moves": moves,
                 "requests": {role_of(t): n for t, n in requests_used.items()},
+                "forfeits": {role_of(t): n for t, n in FORFEITS.items()},
                 "tokens": {role_of(t): n for t, n in tokens_used.items()},
                 "terminal": terminal,
             })
@@ -570,6 +601,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Both agents are released together on their first move (below), so no
         # state is held while waiting and the wait is never charged.
         starting_gun(token)
+
+        # The proxy ENFORCES the round cap. Leaving it to the orchestrator's
+        # poll would hand whichever agent asked first a bonus move, and "equal
+        # turns each" would quietly stop being true.
+        if MODE.termination == "rounds" and MODE.max_rounds:
+            with BARRIER_COND:
+                past_cap = barrier["round"] > MODE.max_rounds
+            if past_cap:
+                send_json(self, 429, {
+                    "error": f"all {MODE.max_rounds} rounds played",
+                    "error_kind": "rounds_complete",
+                })
+                return
 
         # Admission is decided in ONE critical section: bank exhaustion, the
         # request budget, and the one-move-in-flight rule. Splitting these let
@@ -658,6 +702,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 # Charge for a usable answer, or for time the clamp cut short.
                 # An ordinary upstream failure is not the model's fault.
                 MOVE_SECONDS[token].append(round(elapsed, 3))
+                LAST_MOVE_SECONDS[token] = elapsed
                 if MODE.time_bank is not None and BANK_REMAINING[token] is not None:
                     BANK_REMAINING[token] = max(0.0, BANK_REMAINING[token] - elapsed)
                     if BANK_REMAINING[token] <= 0 and token not in EXHAUSTED:

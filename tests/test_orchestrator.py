@@ -111,19 +111,26 @@ class TestRatingDecision(unittest.TestCase):
 
 class TestModeResolution(unittest.TestCase):
     class _Args:
-        mode = "realtime"
+        mode = "time-bank"
         fair = False
         no_shuffle_sides = False
         time_limit = max_rounds = move_timeout = None
         time_bank = max_steps = max_requests = None
 
-    def test_default_is_behaviour_preserving(self):
-        # Phase 0 must not change what a bare invocation does.
+    def test_default_is_the_flagship_mode(self):
+        # time-bank is the only mode that makes the speed/intelligence tradeoff
+        # the variable under study rather than fixing it at one setting.
         mode = orch.resolve_mode(self._Args())
-        self.assertEqual(mode.name, "realtime")
-        self.assertFalse(mode.lockstep)
-        self.assertEqual(mode.wall_clock, 600.0)
-        self.assertEqual(mode.max_steps, 80)
+        self.assertEqual(mode.name, "time-bank")
+        self.assertTrue(mode.lockstep)
+        self.assertIsNotNone(mode.time_bank)
+
+    def test_defaults_cannot_pre_empt_the_bank(self):
+        # A step or request cap below what the bank affords would stop the agent
+        # with time unspent and then mislabel the outcome "banks_exhausted".
+        mode = orch.resolve_mode(self._Args())
+        self.assertGreater(mode.max_steps, mode.time_bank * 5)
+        self.assertGreater(mode.max_requests, mode.max_steps)
 
     def test_fair_is_an_alias_for_untimed(self):
         args = self._Args()
@@ -140,6 +147,13 @@ class TestModeResolution(unittest.TestCase):
         args = self._Args()
         args.time_limit = 42
         self.assertEqual(orch.resolve_mode(args).wall_clock, 42)
+
+    def test_fair_alias_rejects_a_conflicting_mode(self):
+        args = self._Args()
+        args.fair = True
+        args.mode = "realtime"
+        with self.assertRaises(SystemExit):
+            orch.resolve_mode(args)
 
 
 if __name__ == "__main__":

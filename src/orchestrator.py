@@ -108,6 +108,10 @@ def rating_decision(outcome, exit_codes, commands_run, threshold=1):
         # The most dramatic outcome in the game, and unambiguously contested.
         return True, None
     if outcome in DRAWN_OUTCOMES:
+        # `commands_run` here means ENGAGEMENT, not executed commands: an agent
+        # that forfeited rounds to a move deadline did take part and lose them,
+        # which is precisely what that mode measures. Only a match where an
+        # agent did nothing at all is uninformative.
         counts = [n for n in commands_run.values() if n is not None]
         if counts and min(counts) < threshold:
             return False, "agents did not engage"
@@ -1056,6 +1060,15 @@ def main():
             candidates = [n for n in (from_hb, from_log) if n is not None]
             commands[role] = max(candidates) if candidates else None
 
+        # Engagement counts forfeited rounds too: losing a round to the move
+        # deadline is participation, and in move-timed it is the whole point.
+        forfeits = final.get("forfeits") or {}
+        engagement = {
+            role: (None if commands[role] is None
+                   else commands[role] + int(forfeits.get(role) or 0))
+            for role in commands
+        }
+
         # Defence in depth against credential abuse. The proxy counts requests
         # per bearer token; the harness reports the turns IT took. If an agent's
         # token was used far more often than the agent itself acted, someone
@@ -1076,7 +1089,7 @@ def main():
         if rated:
             # The arena gate may already have marked this unrated; only decide
             # here if it did not.
-            rated, unrated_reason = rating_decision(outcome, exit_codes, commands)
+            rated, unrated_reason = rating_decision(outcome, exit_codes, engagement)
         if abuse:
             rated, unrated_reason = False, abuse
 
@@ -1115,6 +1128,9 @@ def main():
             },
             "exit_codes": exit_codes,
             "commands_run": commands,
+            "engagement": engagement,
+            "rounds_played": max(0, (final.get("round") or 1) - 1),
+            "forfeits": final.get("forfeits") or {},
             "usage": usage,
             "inference_seconds": inference,
             "time_bank": bank_summary,

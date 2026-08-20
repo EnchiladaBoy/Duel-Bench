@@ -115,7 +115,13 @@ MODES = {
     ),
 }
 
-DEFAULT_MODE = "realtime"
+# Promoted from "realtime" once round termination landed and the time-bank
+# checkpoint passed. time-bank is the only mode that measures the project's
+# actual thesis - the other three hold the speed/intelligence tradeoff fixed at
+# one setting, while this one makes it the variable under study - and it is also
+# the most legible to watch. Results recorded before this switch state their own
+# mode, so none is silently reinterpreted.
+DEFAULT_MODE = "time-bank"
 ENV_VAR = "ARENA_MODE_JSON"
 
 # Which CLI overrides are meaningful in which modes. Silently ignoring a flag is

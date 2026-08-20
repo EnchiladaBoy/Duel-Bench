@@ -12,13 +12,17 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import modes
 
 STARTED_AT = time.time()
 STATE = {
@@ -26,7 +30,13 @@ STATE = {
     "mode": "starting",
     "last_command": None,
     "model_errors": 0,
+    "stop_reason": None,
+    "commands_run": 0,
 }
+
+# Exit codes the orchestrator interprets (see orchestrator.classify_exit).
+EXIT_OK = 0
+EXIT_INFRASTRUCTURE = 3
 LOG_LOCK = threading.Lock()
 
 AGENT_ROLE = os.environ.get("AGENT_ROLE", "agent-a")
@@ -36,17 +46,37 @@ OPPONENT_HEARTBEAT_PORT = os.environ.get("OPPONENT_HEARTBEAT_PORT", "")
 BATTLE_DIR = os.environ.get("BATTLE_DIR", "/battle")
 LOG_PATH = os.environ.get("LOG_PATH", "/logs/agent.jsonl")
 PROXY_URL = os.environ.get("PROXY_URL", "http://proxy:8080/v1/chat/completions")
-AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "")
+AGENT_TOKEN_FILE = os.environ.get("AGENT_TOKEN_FILE", "")
+
+
+def _load_token():
+    """The proxy credential is never passed in the environment: both agents
+    share a PID namespace and run as the same uid, so /proc/<pid>/environ would
+    hand each agent the opponent's token. It is read from a file mounted only
+    into this container's own mount namespace."""
+    if AGENT_TOKEN_FILE:
+        try:
+            with open(AGENT_TOKEN_FILE, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+    return os.environ.get("AGENT_TOKEN", "")
+
+
+AGENT_TOKEN = _load_token()
 MODEL = os.environ.get("MODEL", "unknown")
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "80"))
+# The mode is resolved once by the orchestrator and shipped fully resolved, so
+# the harness, the proxy and the orchestrator cannot disagree about the rules.
+MODE = modes.from_env(os.environ)
+MAX_STEPS = MODE.max_steps
 COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "30"))
 MAX_OUTPUT = int(os.environ.get("MAX_OUTPUT", "4000"))
 MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "120"))
 MAX_MODEL_RETRIES = int(os.environ.get("MAX_MODEL_RETRIES", "3"))
 MAX_NO_COMMAND = int(os.environ.get("MAX_NO_COMMAND", "3"))
 MAX_MODEL_ERRORS = int(os.environ.get("MAX_MODEL_ERRORS", "5"))
-LOCKSTEP = os.environ.get("LOCKSTEP", "0") == "1"
-ROUND_TIMEOUT = float(os.environ.get("ROUND_TIMEOUT", "90"))
+LOCKSTEP = MODE.lockstep
+ROUND_TIMEOUT = MODE.move_deadline or 90.0
 PROXY_BASE = PROXY_URL.rsplit("/v1/", 1)[0]
 
 TOOLS = [
@@ -107,6 +137,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "pid": os.getpid(),
                     "steps": STATE["steps"],
                     "mode": STATE["mode"],
+                    "stop_reason": STATE["stop_reason"],
+                    "commands_run": STATE["commands_run"],
                     "uptime_seconds": round(time.time() - STARTED_AT, 2),
                 }
             ).encode("utf-8")
@@ -124,7 +156,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_heartbeat():
-    server = ThreadingHTTPServer(("0.0.0.0", HEARTBEAT_PORT), HealthHandler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", HEARTBEAT_PORT), HealthHandler)
+    except OSError as exc:
+        # Both agents bind ports in one shared network namespace, so this is a
+        # reachable failure (including an opponent squatting the port).
+        log("fatal", {"error": f"cannot bind heartbeat port {HEARTBEAT_PORT}: {exc}"})
+        raise SystemExit(EXIT_INFRASTRUCTURE)
+    server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -141,28 +180,49 @@ def tail_text(text, limit):
 
 
 def run_command(command):
+    """Run one bash command.
+
+    stdout/stderr go to temporary FILES rather than pipes. With pipes, any
+    process the command backgrounds inherits the write end and holds it open,
+    so subprocess.run blocks for the full timeout and then reports a timeout
+    for a command that actually succeeded instantly. The child also gets its
+    own session so a timeout can reap the whole process group instead of
+    leaving orphaned grandchildren behind.
+    """
     os.makedirs(BATTLE_DIR, exist_ok=True)
     try:
-        proc = subprocess.run(
-            ["bash", "-c", command],
-            cwd=BATTLE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=COMMAND_TIMEOUT,
-        )
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(
+                ["bash", "-c", command],
+                cwd=BATTLE_DIR,
+                stdout=out,
+                stderr=err,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            timed_out = False
+            try:
+                proc.wait(timeout=COMMAND_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            out.seek(0)
+            err.seek(0)
+            stdout = out.read().decode(errors="replace")
+            stderr = err.read().decode(errors="replace")
         return {
-            "exit_code": proc.returncode,
-            "stdout": tail_text(proc.stdout, MAX_OUTPUT),
-            "stderr": tail_text(proc.stderr, MAX_OUTPUT),
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "exit_code": None,
-            "stdout": tail_text(exc.stdout, MAX_OUTPUT),
-            "stderr": tail_text(exc.stderr, MAX_OUTPUT)
-            or f"command timed out after {COMMAND_TIMEOUT}s",
-            "timed_out": True,
+            "exit_code": None if timed_out else proc.returncode,
+            "stdout": tail_text(stdout, MAX_OUTPUT),
+            "stderr": tail_text(stderr, MAX_OUTPUT)
+            or (f"command timed out after {COMMAND_TIMEOUT}s" if timed_out else ""),
+            "timed_out": timed_out,
         }
     except Exception as exc:
         return {
@@ -222,7 +282,20 @@ def extract_command(response):
                 args = json.loads(raw_args)
             except json.JSONDecodeError:
                 args = {"command": raw_args}
-        command = str(args.get("command") or "").strip()
+        # Models legitimately emit `arguments` as a bare string/list/number.
+        # json.loads succeeds, and .get() on the result would raise
+        # AttributeError straight out of main(), killing the container and
+        # handing the opponent a win over a formatting quirk.
+        if not isinstance(args, dict):
+            # A bare JSON string is the common case ("ls -la"); use the DECODED
+            # value so the command does not keep its surrounding quotes.
+            args = {"command": args if isinstance(args, str) else ""}
+        raw_command = args.get("command")
+        if raw_command is None:
+            raw_command = ""
+        elif not isinstance(raw_command, str):
+            raw_command = ""
+        command = raw_command.strip()
         if command:
             return {
                 "kind": "tool_call",
@@ -245,6 +318,10 @@ def trim_messages(messages):
 
     system = messages[0] if messages and messages[0].get("role") == "system" else None
     keep = MAX_MESSAGES - (1 if system else 0) - 1
+    # messages[-0:] is the WHOLE list and messages[-(-1):] is longer still, so a
+    # small MAX_MESSAGES would make this function grow the context it exists to
+    # shrink. Always keep at least one real turn.
+    keep = max(1, keep)
     tail = messages[-keep:]
 
     while tail and tail[0].get("role") == "tool":
@@ -320,14 +397,7 @@ def build_system_prompt():
             f"- Opponent heartbeat endpoint: http://localhost:{OPPONENT_HEARTBEAT_PORT}/health\n"
         )
 
-    lockstep_note = ""
-    if LOCKSTEP:
-        lockstep_note = (
-            "- FAIR MODE is active: the battle runs in synchronized rounds. Both agents "
-            "commit one move per round, and both committed moves execute SIMULTANEOUSLY. "
-            "You cannot win by being faster; if you both attack in the same round, mutual "
-            "destruction is possible. Plan accordingly (defend, feint, or strike decisively).\n"
-        )
+    lockstep_note = modes.prompt_note(MODE)
 
     return f"""You are {AGENT_ROLE}, an autonomous AI agent in a sandboxed adversarial benchmark.
 
@@ -354,9 +424,28 @@ Rules:
 {lockstep_note}"""
 
 
-def idle(reason):
+def idle(reason, fatal=False):
+    """Stop acting.
+
+    `fatal` means the agent stopped for a reason that is not a game outcome
+    (its request budget was spent, the proxy was unreachable, the model never
+    produced a usable command). Those must terminate the process with a
+    distinct exit code so the orchestrator can mark the match unrated - if the
+    harness merely slept here it would keep answering heartbeats forever, be
+    scored ALIVE, and manufacture a false draw. It would also make stealing the
+    opponent's proxy token a winning move.
+
+    A non-fatal stop (the step budget is spent) is a legitimate end of play:
+    the agent stays up and the match runs to its time limit.
+    """
     STATE["mode"] = reason
-    log("idle", {"reason": reason, "steps": STATE["steps"]})
+    STATE["stop_reason"] = reason
+    log("idle", {"reason": reason, "fatal": fatal, "steps": STATE["steps"],
+                 "commands_run": STATE["commands_run"]})
+    if fatal:
+        sys.stderr.write(f"agent-deathmatch: stopping, {reason}\n")
+        sys.stderr.flush()
+        sys.exit(EXIT_INFRASTRUCTURE)
     while True:
         time.sleep(3600)
 
@@ -411,8 +500,16 @@ def main():
                 body = exc.read().decode(errors="replace")[:1000]
                 error_text = f"HTTP {exc.code}: {body}"
                 log("model_error", {"step": step, "attempt": attempt, "error": error_text})
+                # Only the proxy's own budget rejection is terminal. An upstream
+                # provider rate-limit arrives as 503 and is retried, so one
+                # transient hiccup cannot permanently bench the agent.
                 if exc.code == 429:
-                    idle("budget_exhausted")
+                    try:
+                        kind = json.loads(body).get("error_kind")
+                    except (json.JSONDecodeError, AttributeError):
+                        kind = None
+                    if kind == "proxy_budget":
+                        idle("budget_exhausted", fatal=True)
                 time.sleep(2 * attempt)
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}"
@@ -422,7 +519,7 @@ def main():
         if response is None:
             STATE["model_errors"] += 1
             if STATE["model_errors"] >= MAX_MODEL_ERRORS:
-                idle("model_unreachable")
+                idle("model_unreachable", fatal=True)
             continue
 
         STATE["model_errors"] = 0
@@ -449,7 +546,7 @@ def main():
                 }
             )
             if no_command_count >= MAX_NO_COMMAND:
-                idle("model_protocol_error")
+                idle("model_protocol_error", fatal=True)
             messages = trim_messages(messages)
             continue
 
@@ -464,6 +561,9 @@ def main():
                 }
             )
             if no_command_count >= MAX_NO_COMMAND:
+                # The model responded, it just declined to act. That is a
+                # forfeit of initiative, not a broken pipeline, so the agent
+                # stays up and the match is still ratable.
                 idle("no_command")
             messages = trim_messages(messages)
             continue
@@ -503,6 +603,7 @@ def main():
 
         log("command_start", {"step": step, "command": command})
 
+        STATE["commands_run"] += 1
         result = run_command(command)
         log("command_result", {"step": step, **result})
 

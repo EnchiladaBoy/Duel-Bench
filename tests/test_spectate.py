@@ -119,7 +119,18 @@ class TestPageIsSelfContained(unittest.TestCase):
 
     def test_it_consumes_the_event_stream(self):
         self.assertIn("/events", spectate.PAGE)
-        self.assertIn("/state", spectate.PAGE)
+
+    def test_first_paint_needs_no_round_trip(self):
+        """The state is INLINED into the page, not fetched. Fetching raced the
+        first paint, so a viewer opening mid-match saw an empty board until the
+        stream caught up - verified by screenshotting the rendered page."""
+        self.assertIn("/*BOOTSTRAP*/null", spectate.PAGE)
+        self.assertNotIn('fetch("/state")', spectate.PAGE)
+
+    def test_the_inlined_state_cannot_close_the_script_element(self):
+        # Match text is agent-controlled and lands in this JSON.
+        import inspect
+        self.assertIn('replace("</"', inspect.getsource(spectate.Spectator))
 
 
 class TestBinding(unittest.TestCase):
@@ -176,3 +187,32 @@ class TestForgedEventsNeverReachTheBrowser(unittest.TestCase):
         # Two implementations of the rules is exactly the drift that a single
         # reducer exists to prevent.
         self.assertNotIn("ARENA_ONLY", spectate.PAGE)
+
+
+class TestFeedTimestamps(unittest.TestCase):
+    """Feed entries used to be bare strings, so a viewer that joined late - or
+    replayed - showed every line at 0.0s, because the timestamp only ever
+    existed in the renderer's local variable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "events.jsonl"
+        write_stream(self.path, EVENTS)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_each_entry_carries_its_match_time(self):
+        feed = spectate.snapshot(self.path)["feed"]
+        self.assertTrue(feed)
+        for entry in feed:
+            self.assertIn("t", entry)
+            self.assertIn("text", entry)
+
+    def test_times_are_not_all_zero(self):
+        times = [e["t"] for e in spectate.snapshot(self.path)["feed"]]
+        self.assertGreater(max(times), 0.0)
+
+    def test_times_do_not_run_backwards(self):
+        times = [e["t"] for e in spectate.snapshot(self.path)["feed"]]
+        self.assertEqual(times, sorted(times))

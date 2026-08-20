@@ -71,7 +71,10 @@ class MatchState:
         })
 
     def note(self, text):
-        self.feed.append(text)
+        # Carry the match time with the entry. Storing bare strings meant a
+        # viewer that joined late - or replayed - showed every line at 0.0s,
+        # because the timestamp only existed in the renderer's local variable.
+        self.feed.append((round(self.elapsed, 1), text))
         del self.feed[:-200]
 
     # The harness prints its log to container stdout and the orchestrator
@@ -213,8 +216,9 @@ def render(state):
             out.append(f"   {GREY}$ {agent['last'][:width - 8]}{RESET}" + CLEAR_LINE)
 
     out.append(GREY + "─" * min(width, 96) + RESET + CLEAR_LINE)
-    for line in state.feed[-FEED_LINES:]:
-        out.append(" " + line[:width + 40] + CLEAR_LINE)
+    for when, line in state.feed[-FEED_LINES:]:
+        stamp = f"{GREY}{when:>6.1f}s{RESET} "
+        out.append(" " + stamp + line[:width + 30] + CLEAR_LINE)
     out.extend([CLEAR_LINE] * max(0, FEED_LINES - len(state.feed[-FEED_LINES:])))
     sys.stdout.write("\n".join(out))
     sys.stdout.flush()
@@ -243,8 +247,8 @@ def follow(path, state, interactive):
         if interactive:
             render(state)
         elif fresh:
-            for line in state.feed[-FEED_LINES:]:
-                print(line)
+            for when, line in state.feed[-FEED_LINES:]:
+                print(f"{when:>7.1f}s {line}")
             state.feed.clear()
         if state.finished:
             return
@@ -273,8 +277,8 @@ def replay(path, state, interactive, speed):
         if interactive:
             render(state)
         else:
-            for line in state.feed[-1:]:
-                print(line)
+            for when, line in state.feed[-1:]:
+                print(f"{when:>7.1f}s {line}")
             state.feed.clear()
 
 

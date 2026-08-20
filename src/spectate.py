@@ -66,7 +66,9 @@ def snapshot(path):
         "mode": state.mode, "models": state.models, "round": state.round,
         "elapsed": state.elapsed, "bank_granted": state.bank_granted,
         "agents": state.agents, "finished": state.finished,
-        "feed": [strip_ansi(line) for line in state.feed[-40:]],
+        "elapsed_at_snapshot": state.elapsed,
+        "feed": [{"t": when, "text": strip_ansi(line)}
+                 for when, line in state.feed[-40:]],
     }
 
 
@@ -91,7 +93,13 @@ class Spectator(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            return self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+            # The snapshot is INLINED rather than fetched. A fetch races the
+            # first paint, so a viewer opening mid-match - or a screenshot -
+            # sees an empty board until the stream catches up. "</" is escaped
+            # so match text can never close the script element early.
+            boot = json.dumps(snapshot(self.events_path)).replace("</", "<\\/")
+            page = PAGE.replace("/*BOOTSTRAP*/null", boot)
+            return self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
         if self.path == "/state":
             return self._send(200, "application/json",
                               json.dumps(snapshot(self.events_path)).encode())
@@ -308,9 +316,19 @@ function render(){
       +(d.rated?'':' <span class="badge">unrated: '+esc(d.unrated_reason||"")+'</span>')+'</div>';}
 }
 
-fetch("/state").then(r=>r.json()).then(s=>{
-  S.mode=s.mode; S.models=s.models||{}; S.bank=s.bank_granted; S.round=s.round; render();
-}).catch(()=>{});
+const BOOT = /*BOOTSTRAP*/null;
+if(BOOT){
+  S.mode=BOOT.mode||"—"; S.models=BOOT.models||{}; S.bank=BOOT.bank_granted;
+  S.round=BOOT.round; S.t=BOOT.elapsed||0; S.done=BOOT.finished||null;
+  for(const[k,v]of Object.entries(BOOT.agents||{})){
+    const a=agent(k);
+    a.alive=v.alive!==false; a.cmds=v.commands||0; a.bank=v.bank;
+    a.last=v.last||""; a.passes=v.passes||0; a.forfeits=v.forfeits||0;
+    a.stop=v.stop_reason||null;
+  }
+  (BOOT.feed||[]).forEach(e=>note(e.t,e.text));
+}
+render();
 const es=new EventSource("/events");
 es.onopen=()=>$("conn").textContent="● live";
 es.onmessage=m=>apply(JSON.parse(m.data));

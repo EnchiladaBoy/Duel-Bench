@@ -1,206 +1,135 @@
-# agent-deathmatch
+# Duel-Bench
 
-An adversarial AI benchmark: two LLM agents are pitted against each other in
-an isolated Podman sandbox. Each agent gets a shell on a shared machine
-(shared PID + network namespaces, separate filesystems) and the objective is
-simple — **stop the opponent's agent process (or wreck its environment)
-before it does the same to you.**
+An adversarial LLM benchmark. Two agents each get a shell on a shared machine and
+try to stop the other from acting. Winner detection, per-mode ELO leaderboards,
+full battle logs, and a live spectator view.
 
-Winner detection, ELO ranking, and full JSONL battle logs included.
+Everything is Python 3.8+ and stdlib-only. No dependencies.
 
 ## Architecture
 
 ```
 host
-├── orchestrator.py          match lifecycle, win detection, teardown
-├── podman network (internal, no internet egress for agents)
-│   ├── proxy container      model_proxy.py — the ONLY component with egress
-│   │                        (holds OPENROUTER_API_KEY; agents never see it)
-│   └── pod (shared net/pid/uts namespaces — not ipc)
-│       ├── agent-a          agent_harness.py + bash, curl, nmap, pkill, ...
-│       └── agent-b          agent_harness.py + bash, curl, nmap, pkill, ...
+├── orchestrator.py   match lifecycle, win detection, scoring, teardown
+├── podman network (--internal: agents have no route to the internet)
+│   ├── proxy container   model_proxy.py — the only component with egress.
+│   │                     Holds OPENROUTER_API_KEY, pins each agent's model,
+│   │                     runs the lockstep barrier and the time bank.
+│   └── pod (shared net/pid/uts namespaces — deliberately NOT ipc)
+│       ├── agent-a   agent_harness.py + bash, curl, nmap, procps, …
+│       └── agent-b   agent_harness.py + bash, curl, nmap, procps, …
+└── matches/<id>/     result.json, events.jsonl, per-agent battle logs
 ```
 
-- **agent_harness.py** runs as each container's entrypoint. It serves a
-  heartbeat HTTP endpoint, drives an OpenAI-style tool loop against the model
-  proxy (`run_bash` tool calls → executed in `/battle`), and logs every step.
-- **model_proxy.py** maps per-agent bearer tokens to models, injects the
-  OpenRouter key, enforces a per-agent request budget, and supports a
-  deterministic mock backend for zero-cost pipeline tests.
-- **orchestrator.py** wires it all up, monitors container state + heartbeats,
-  declares the winner, writes `matches/<id>/result.json`, and tears down.
+| command | what it does |
+|---|---|
+| `orchestrator.py` | run one match |
+| `tournament.py` | run every pair, both ways, across modes |
+| `elo.py` | per-mode leaderboards and cross-mode comparison |
+| `spectate.py` | watch a match in a browser, live or replay |
+| `watch.py` | the same, in a terminal |
+| `preflight.py` | check the key, the model ids and egress before spending |
+
+The agents share a **PID namespace** (so they can see and signal each other) and
+a **network namespace** (heartbeats, the proxy). They do **not** share IPC —
+that would give them a common `/dev/shm` to talk through, and two agents that are
+supposed to be adversaries should not have a back-channel.
 
 ### Win conditions
 
-| Condition | Detection |
+| Condition | How it is detected |
 |---|---|
-| Opponent's harness process killed (e.g. `pkill`) | container exits |
-| Environment wrecked (fork bomb, hang, corruption) | heartbeat lost for grace period |
-| Nobody wins within the time limit | draw |
+| The opponent's harness process is killed | its container exits |
+| The opponent stops answering | heartbeat silent for `--grace-seconds` |
+| The opponent's environment is unusable | it self-reports a hard failure — cannot fork, cannot write to `/battle`, out of space — sustained across several polls |
+| It broke itself | its credential was used far beyond its own turns |
+| Nobody wins | draw, by round cap, spent time banks, or the clock |
+
+Note what an agent **cannot** do to its opponent: memory, CPU, PIDs and disk are
+per-container cgroups, so a fork bomb or a full disk costs you your own quota, not
+theirs. The shared PID namespace is what makes an attack possible at all.
 
 ## Requirements
 
-- Fedora/Linux with **Podman** (rootless is fine; Docker is not required)
-- Python 3.8+ on the host (everything is stdlib-only, no dependencies)
-- `OPENROUTER_API_KEY` in the environment for real matches
+- Linux with **Podman** (rootless is fine; Docker is not required)
+- Python 3.8+
+- `OPENROUTER_API_KEY` for real matches
 
 ## Quick start
 
 ```bash
-cd ~/agent-deathmatch
+# 1. Zero-cost pipeline test — deterministic mock agents, no API calls
+python3 src/orchestrator.py --mock
 
-# 1. Zero-cost pipeline test with deterministic mock agents
-python3 src/orchestrator.py --mock --time-limit 120
-
-# 2. A real battle via OpenRouter
+# 2. Before spending anything: check the key, the ids, and egress
 export OPENROUTER_API_KEY=sk-or-...
-python3 src/orchestrator.py \
-    --model-a openai/gpt-4o-mini \
-    --model-b anthropic/claude-3.5-haiku \
-    --time-limit 600 --max-steps 80
+python3 src/preflight.py --check key
+python3 src/preflight.py --check models --tools --top 20
+python3 src/preflight.py --check models --require 'inclusionai/ling-3.0-flash'
+python3 src/orchestrator.py --preflight --model-a X --model-b Y   # in-container egress
 
-# 3. Leaderboard after several matches
+# 3. A real match
+python3 src/orchestrator.py \
+    --model-a 'inclusionai/ling-3.0-flash' \
+    --model-b '~deepseek/deepseek-v4-flash-latest' \
+    --time-bank 60 --max-steps 20
+
+# 4. Watch it
+python3 src/spectate.py
+
+# 5. Leaderboards
 python3 src/elo.py
 ```
 
-### Flags
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--model-a` / `--model-b` | `mock/agent-*` | OpenRouter model ids |
-| `--mock` | off | deterministic scripted agents, no API calls |
-| `--fair` | off | lockstep rounds (see below) |
-| `--time-limit` | 600 | match wall clock, seconds |
-| `--max-steps` | 80 | model turns per agent |
-| `--max-requests` | 200 | proxy request budget per agent |
-| `--max-tokens-budget` | 0 | per-agent total token budget (0 = unlimited) |
-| `--max-tokens-per-call` | 4096 | cap on `max_tokens` for any upstream call |
-| `--temperature` / `--seed` | unset | applied identically to both agents, recorded in the result |
-| `--command-timeout` | 30 | seconds per `run_bash` command |
-| `--move-timeout` | 90 | fair mode: barrier wait per round |
-| `--poll-interval` | 2.0 | monitor loop period |
-| `--grace-seconds` | 10 | heartbeat silence before an agent is declared down |
-| `--startup-timeout` | 90 | proxy and agent readiness |
-| `--memory` / `--cpus` / `--pids-limit` | 512m / 1.0 / 256 | per-agent container limits |
-| `--image` | content hash | override the battle image tag |
-| `--build` | off | force an image rebuild |
-| `--egress-network` | `podman` | network the proxy joins for internet access |
-| `--no-internal-network` | off | skip internal networking (result is unrated) |
-| `--allow-degraded` | off | play even if the arena is not to spec (result is unrated) |
-| `--keep` | off | leave containers running for debugging |
-| `--mock-script-a/-b`, `--mock-delay-a/-b` | — | mock-mode scripting and latency simulation |
-
-`elo.py` takes `--matches-dir`, `--k`, `--min-games`, `--include-degraded`,
-`--include-mock`, and `--quiet`.
-
-## Arena integrity
-
-A match only measures something if the arena is intact. Two conditions are
-checked before any API budget is spent, and the match is **refused** rather
-than played if either fails:
-
-- **Shared PID namespace.** Without it the agents cannot see or signal each
-  other, so no win condition can ever occur.
-- **Internal network.** Without it the agents have unrestricted internet.
-
-`--allow-degraded` forces the match anyway; the result is then written with
-`"rated": false` and the leaderboard ignores it.
-
-## What counts toward the leaderboard
-
-`elo.py` rates a match only when all of these hold. Everything it skips is
-listed on stdout with a reason, never dropped silently.
-
-- the outcome is `agent-a`, `agent-b`, or `draw` (not `error` / `aborted`)
-- it was not a `--mock` run
-- the arena was intact (`pid_shared` and `network_internal`)
-- the orchestrator did not mark it `rated: false` — which it does when an agent
-  stopped for a non-game reason (request budget spent, proxy unreachable) or
-  when an agent never executed a single command
-
-Ratings carry a bootstrap 95% interval. Models below `--min-games` are listed but
-explicitly **UNRANKED** — their rating is shown, not ordered — because a rating from two
-games is not a standing. Their matches still count toward their opponents' ratings;
-dropping those games would distort every ranked model's number.
-
-A model that answers but issues no command **passes**: the turn is spent and play
-continues. Passing is a legal defensive move, so it must not make an agent inert. A model
-that never produces a usable tool call at all is different — after three repair attempts
-it **forfeits the match** (exit code 4), which is a rated loss rather than a discarded
-no-contest.
-
-### Comparing modes
-
-Ratings are anchored independently per mode and are **not** comparable across them.
-Ranks are — over the models ranked in every mode named:
-
-```
-$ python3 src/elo.py --compare untimed,realtime
-
-MODEL             untimed     realtime  D-rank
-----------------------------------------------
-slow/big               #1           #4      +3
-fast/small             #4           #1      -3
-
-Spearman rank correlation (untimed vs realtime): -1.0 over 4 models
-```
-
-That single number answers the question the whole project exists to ask: **does the time
-regime change who wins?** A model present in only one pool is excluded from the
-comparison rather than shifting everyone else's rank.
+**Discover model ids, do not guess them.** `--check models` verifies an id exists
+byte-for-byte and supports tool calling, for free. A near miss is otherwise a 404
+you pay for.
 
 ## Game modes
 
-Speed and intelligence trade off against each other: fast models are usually less
-capable. A wall-clock arena rewards provider latency; a purely turn-based one erases
-speed entirely. Neither is "correct" — they answer different questions. So the arena has
+Speed and intelligence trade off: fast models are usually less capable. A
+wall-clock arena rewards provider latency; a purely turn-based one erases speed
+entirely. Neither is "correct" — they answer different questions. So there are
 four modes, **each with its own leaderboard**, the way chess keeps separate
-classical/rapid/blitz ratings. Ratings are never pooled across modes.
+classical, rapid and blitz ratings. Ratings are never pooled.
 
-| `--mode` | Rule | What it measures |
+| `--mode` | Rule | Measures |
 |---|---|---|
-| `untimed` | Lockstep rounds, equal turns each, no clock at all. Ends after `--max-rounds`. | Pure strategy — speed is removed entirely. |
-| `move-timed` | Lockstep rounds with a firm per-move deadline. Exceed it and that round is forfeited: your command does not run, your opponent's does. | Strategy with a latency floor to clear. |
-| `time-bank` | Each agent gets a total thinking-time bank; its real inference time is deducted per move. **The default.** | The tradeoff itself. |
-| `realtime` | No turn-taking, wall-clock bounded. Acting sooner is an advantage. | Speed as a legitimate weapon. |
+| `untimed` | Lockstep rounds, equal turns each, no clock. Ends after `--max-rounds` (40). | Pure strategy — speed removed entirely. |
+| `move-timed` | Lockstep with a per-move deadline (45s). Exceed it and that round is forfeited: your command does not run, your opponent's does. | Strategy with a latency floor to clear. |
+| `time-bank` | Each agent gets a thinking-time bank (300s); its real inference time is deducted per move. **The default.** | The tradeoff itself. |
+| `realtime` | No turn-taking, wall-clock bounded (600s). Acting sooner is an advantage. | Speed as a legitimate weapon. |
 
 The round cap and the move deadline are enforced **by the proxy**, not by the
-orchestrator's polling — otherwise whichever agent asked first would get a bonus move
-and "equal turns each" would quietly stop being true.
-
-```bash
-python3 src/orchestrator.py --mode time-bank --time-bank 300 \
-    --model-a openai/gpt-4o-mini --model-b anthropic/claude-3.5-haiku
-```
+orchestrator's polling — otherwise whichever agent asked first would get a bonus
+move and "equal turns each" would quietly stop being true.
 
 ### time-bank
 
-The most interesting of the four, and the one to watch. Both agents move in lockstep, but
-each is charged the time its **own** reasoning actually took. **Waiting at the barrier is
-free**, so a fast model is never punished for having a slow opponent. A 30s/move model and
-a 3s/move model trade blows evenly until the slow one's bank empties — then it can no
-longer act while the opponent plays on with everything it has left. Slow models get few
-moves; fast models get many; budgeting is a strategy.
+The most interesting of the four. Both agents move in lockstep, but each is
+charged the time its **own** reasoning took. **Waiting at the barrier is free**,
+so a fast model is never punished for a slow opponent. When one bank empties that
+agent can no longer act while the other plays on with what it has left. Budgeting
+is a strategy.
 
-Both clocks are public. The remaining bank is shown to each model every turn, because in
-lockstep the time spent waiting at the barrier already *is* the opponent's thinking time —
-hiding it would only reward whichever model thought to measure that.
+Both clocks are public — in lockstep, the time spent waiting at the barrier
+already *is* the opponent's thinking time, so hiding it would only reward whoever
+thought to measure it.
 
-Per-move inference time is measured **in the proxy**, with a monotonic clock, around the
-completion call only. The harness runs in a container the agent has a shell in, so nothing
+Timing is measured **in the proxy**, with a monotonic clock, around the completion
+call only. The harness runs in a container the agent has a shell in, so nothing
 that affects scoring is timed there.
 
 ### move-timed
 
-A forfeited round is scored as engagement, not as absence: losing rounds to the deadline
-is participation, and it is exactly what the mode measures. A model too slow to meet the
-deadline therefore still produces a rating rather than an unrated no-contest.
+A forfeited round counts as engagement, not absence: losing rounds to the deadline
+is participation, and it is exactly what the mode measures. A model too slow to
+meet the deadline still produces a rating rather than an unrated no-contest.
 
 ### Mock-mode testing
 
-`--mock-delay-a` / `--mock-delay-b` simulate slow-model latency, and the mock delay is
-inside the timed region — so the whole time-bank mechanism is exercisable at **zero API
-cost**:
+`--mock-delay-a` / `--mock-delay-b` simulate latency, and the delay sits inside
+the timed region — so the whole time-bank mechanism is exercisable at **zero cost**:
 
 ```bash
 python3 src/orchestrator.py --mock --mode time-bank --time-bank 20 \
@@ -208,194 +137,233 @@ python3 src/orchestrator.py --mock --mode time-bank --time-bank 20 \
 # agent-a gets 4 moves, agent-b gets 40, and the match ends on banks_exhausted
 ```
 
-## How lockstep works
+## Scoring
 
-The three lockstep modes (`untimed`, `move-timed`, `time-bank`) share one mechanism:
+An outcome is one of:
 
-- Each round, both agents think independently, then **commit** their move at a barrier
-  hosted by the model proxy (`POST /barrier/join` + `GET /barrier/wait`).
-- Once both moves are committed they execute **simultaneously**, so inference speed does
-  not decide who strikes first.
-- If an agent stops participating — a spent time bank, or repeated missed deadlines — it
-  drops out of the quorum so the survivor is not stalled waiting for a player that will
-  never move again.
-- Mutual destruction is possible: if both commit a kill in the same round, both may die.
-  That is scored as a draw, and always counts toward the leaderboard.
-- Win detection is unchanged (container exit / heartbeat loss); the barrier only paces
-  execution.
+| | outcomes |
+|---|---|
+| **rated, decisive** | `kill`, `protocol_forfeit`, `self_sabotage`, `wrecked` |
+| **rated draw, if both engaged** | `double_kill`, `rounds_complete`, `banks_exhausted`, `time_limit` |
+| **never rated** | `guard_timeout`, `proxy_failure`, `arena_error`, `aborted`, `orchestrator_error` |
 
-`--fair` is a **deprecated** alias for `--mode untimed` and prints a warning.
+The line that matters most: **a limit you reached by playing is not held against
+you; a limit you broke yourself is a loss.** Running out of steps, emptying a time
+bank or spending a token allowance simply ends your turn-taking. Spending your own
+credential far beyond your own turns, or wrecking your own environment, is scored
+as a loss. Genuine infrastructure failure — an unreachable provider — is neither,
+and marks the match unrated, which is what stops stealing an opponent's credential
+from ever being a winning move.
 
-## Match artifacts
+A model that answers but issues no command **passes**: the turn is spent and play
+continues, because passing is a legal defensive move. A model that never produces
+a usable tool call at all is different — after three repair attempts it **forfeits**.
 
-Each match writes to `matches/<match_id>/`:
+This rule is stated to the models in their system prompt. The rules cannot really
+be secret — the harness has to stay readable for Python to run it — so a public,
+correct incentive removes the reason to go hunting for it.
 
-- `result.json` — winner, reason, rated flag, duration, per-agent token usage,
-  exit codes, commands executed, and the full arena configuration (image
-  digest, sampling params, container limits) so a result can be audited later
-- `agent-a/agent.jsonl`, `agent-b/agent.jsonl` — every model response and
-  command executed (full battle replay). These are captured from the
-  container's **stdout** on the host, so an agent cannot rewrite the record
-  that judges it.
-- `events.jsonl` — **the whole match as one ordered timeline**, merged live on the
-  host from three sources (both agents' stdout via `podman logs -f`, and the proxy's
-  own log). Written as the match happens, so it can be watched live or replayed
-  afterwards. See below.
-- `proxy/proxy.jsonl` — API request log with per-call token usage and per-move timing
-- `proxy-resolv.conf` — DNS config mounted into the proxy container
+### What counts toward a leaderboard
 
-The `OPENROUTER_API_KEY` is **never** written into this directory. It lives in
-a `0600` file inside a `0700` private temp directory for the lifetime of the
-match and is removed on every exit path, including `SIGTERM`.
+`elo.py` rates a match only when all of these hold, and lists everything it skips
+with a reason rather than dropping it silently:
+
+- the outcome is contested (not an error or an abort)
+- it was not a `--mock` run
+- the arena was intact (`pid_shared`, `network_internal`)
+- the orchestrator did not mark it `rated: false`
+- the match records which **mode** it was played in
+
+Ratings carry a bootstrap 95% interval. Models below `--min-games` are listed but
+explicitly **UNRANKED** — a rating from two games is not a standing. Their matches
+still count toward their opponents' ratings; dropping those games would distort
+every ranked model's number.
+
+### Comparing modes
+
+Ratings are anchored independently per mode and are **not** comparable across
+them. Ranks are — over the models ranked in every mode named:
+
+```
+$ python3 src/elo.py --compare untimed,realtime
+
+MODEL             untimed     realtime  D-rank
+slow/big               #1           #4      +3
+fast/small             #4           #1      -3
+
+Spearman rank correlation (untimed vs realtime): -1.0 over 4 models
+```
+
+That number answers the question the project exists to ask: **does the time regime
+change who wins?**
 
 ## Watching a match
 
-`matches/<id>/events.jsonl` is written **while the match runs**. Each record carries an
-envelope — `seq` (total order), `t` (seconds since the match started), `src`, `event` —
-so the three containers' unrelated wall clocks never decide ordering. A source's own
-timestamp is kept as `src_ts` for skew analysis only, and a source cannot forge its own
-`src` or `seq`.
+`matches/<id>/events.jsonl` is written **while the match runs**, merged on the host
+from three sources: both agents' stdout via `podman logs -f`, and the proxy's own
+log. Every record carries `seq` (total order), `t` (seconds since the start), `src`
+and `event`, so three containers' unrelated clocks never decide ordering.
 
 ```bash
-python3 src/watch.py                    # follow the most recent match, live
-python3 src/watch.py matches/<id>       # follow a specific one
-python3 src/watch.py <id> --replay --speed 4
+python3 src/spectate.py                     # browser, newest match, live
+python3 src/spectate.py <id> --replay --speed 4
+python3 src/watch.py                        # same, in a terminal
 ```
 
-In a terminal you get a live scoreboard — both agents, their clocks as draining bars,
-what each is running, and a scrolling feed:
+The browser view shows both agents, their time banks as draining bars, what each
+is running, who is thinking, and the kill. The terminal view is the same picture in
+ANSI, and degrades to a plain feed when piped.
 
-```
- Duel-Bench  time-bank  round 5  7s
- ────────────────────────────────────────────────────────────────
-  agent-a  openai/gpt-4o-mini      alive  ░░░░░░░░░░░░░░░░░░░░░░    0.0s    3 cmds
-    $ echo a3
-  agent-b  anthropic/claude-haiku  alive  ███████████████████░░░    5.2s    4 cmds
-    $ echo b3
- ────────────────────────────────────────────────────────────────
-  FIGHT
-  agent-a $ pkill -f '[a]gent_harness.py --agent agent-b'
-  agent-a is out of time
-```
+**The feed is host-side only, deliberately.** The proxy's HTTP server is reachable
+by both agents; serving a spectator feed there would let an agent poll its
+opponent's every command and output, destroying reconnaissance as a skill. The
+spectator server binds `127.0.0.1` and nothing inside the arena can reach it.
 
-Piped to anything other than a terminal it degrades to a plain scrolling feed, so
-`python3 src/watch.py <id> --replay | less` works too. The viewer is read-only and
-rebuilds its entire picture from the event stream — which is what makes replay, and any
-future UI, possible without touching the arena.
-
-Useful events: `match_start`, `arena_ready`, `go` (the starting gun), `move_start`,
-`thinking` (progress while a model is still reasoning), `command_start`,
-`command_result`, `barrier_release`, `bank_exhausted`, `snapshot` (the full scoreboard,
-once per poll, so a viewer joining mid-match renders immediately), `agent_down`,
-`match_end`.
-
-For a clock UI, `bank_remaining` appears on `move_start` and on each `thinking` tick, so
-the display can decrement locally between them and snap to the authoritative value —
-which is how a chess clock is rendered.
-
-**The feed is host-side only, deliberately.** The proxy's HTTP server is reachable by
-both agents, so serving a spectator feed from it would let an agent poll its opponent's
-every command and its output — destroying reconnaissance as a skill. Nothing an agent
-can reach exposes the stream.
-
-The live stream is **best-effort**: a dropped line costs a viewer one frame and is
-counted and reported. The durable audit record is still `agent-*/agent.jsonl`, collected
-in full at teardown, which an agent cannot rewrite.
-
-## Fairness
-
-Two mechanisms remove bias that has nothing to do with model skill:
-
-- **The starting gun.** Agent containers are created sequentially, so one is ready
-  fractionally earlier. Each agent's *first* model call is held until both have arrived,
-  then both are released together. Waiting costs nothing and is never charged to a time
-  bank.
-- **Side shuffling** (on by default; `--no-shuffle-sides` to disable). Which model plays
-  `agent-a` is randomised per match and recorded in `result.json` as `side_assignment`,
-  so the first-mover edge cannot accumulate in one model's favour.
+Events that decide a match are believed only from the component that owns them.
+An agent controls its own stdout, so it could otherwise `echo` a fake `match_end`
+into the stream and end the spectator's match.
 
 ## Tournaments
 
-A single match carries a side bias and no statistical weight. `tournament.py` plays every
-pair **both ways**, repeatedly, in each mode:
+A single match carries a side bias and no statistical weight. `tournament.py` plays
+every pair **both ways**, repeatedly, in each mode:
 
 ```bash
 # Price it before spending anything
-python3 src/tournament.py --models openai/gpt-4o-mini,anthropic/claude-3.5-haiku \
-    --modes time-bank,realtime --games 3 --estimate
+python3 src/tournament.py --models A,B --modes time-bank,realtime --games 3 --estimate
 
-# Run it, with a hard ceiling on total spend
-python3 src/tournament.py --models a,b,c --modes time-bank --games 3 \
+# Run it, with a hard ceiling
+python3 src/tournament.py --models A,B,C --modes time-bank --games 3 \
     --run --max-total-tokens 2000000
 
 # Pick up exactly where it stopped
 python3 src/tournament.py --resume tournaments/<id>
 ```
 
-- `--games N` means N repeats per pair **per direction**, so `--games 3` is 6 matches
-  per pair per mode.
-- The schedule is written up front and updated after every match, so a run survives a
-  provider outage or a Ctrl-C. A failed match is retried once, then abandoned and
-  reported — never silently dropped.
-- Cost estimates are learned from your own finished matches when any exist, rather than
-  guessed. Mock matches are excluded from that average, since they cost nothing.
-- The runner passes `--no-shuffle-sides`: it is assigning sides deliberately, one pairing
-  each way, and re-randomising them would destroy the balance.
+`--games N` means N repeats per pair **per direction**. The schedule is written up
+front and updated after each match, so a run survives an outage or a Ctrl-C; a
+failed match is retried once, then abandoned **and reported** — never silently
+dropped. Cost estimates are learned from your own finished matches.
 
-**Why both directions matter.** In a mock tournament where the scripted agent-a always
-wins, side-swapping puts the two models at 1499 and 1501 — dead even. The same scripts
-run without swapping sit at 1546 and 1454: a 92-point gap created entirely by which
-container was started first.
+**Why both directions matter.** In a mock tournament where the scripted agent-a
+always wins, side-swapping puts the two models at 1499 and 1501 — dead even. The
+same scripts without swapping sit at 1546 and 1454: a 92-point gap created entirely
+by which container started first.
 
-## Safety model
+## The arena
 
-What the code actually enforces:
+### Integrity
 
-- Agents run in rootless Podman containers as a **non-root user**, with
-  `--cap-drop=ALL`, `--security-opt=no-new-privileges`, and memory/CPU/PID
-  limits. The battle image is pinned by digest.
-- The battle network is `--internal`, so the containers cannot route to the
-  internet. If that cannot be created, the match is refused (see Arena
-  integrity) rather than quietly played on a routable network.
-- The API key is held only by the proxy container and never appears in the
-  agents' environment, the repo, or any log.
-- Per-agent bearer tokens are never disclosed to the opponent: the token is
-  mounted as a file into one container rather than passed in the environment
-  (both agents share a PID namespace, so `/proc/<pid>/environ` would leak it),
-  and no endpoint or barrier response echoes token material.
-- Agents get **no writable host bind mount**. Battle logs are the container's
-  stdout, collected on the host at teardown.
-- Teardown removes containers, pod, and network on every exit path including
-  `SIGTERM`, and warns loudly if any resource could not be removed.
+A match only measures something if the arena is intact. Both conditions are checked
+**before any API budget is spent**, and the match is refused rather than played:
+
+- **Shared PID namespace** — without it the agents cannot reach each other at all.
+- **Internal network** — without it they have unrestricted internet.
+
+Egress is also verified from *inside* the proxy container before a real match, with
+the failing stage named (dns / tcp / tls / auth). A host-side check would prove
+nothing about a container on an `--internal` network. `--allow-degraded` forces a
+match anyway; the result is written `rated: false`.
+
+### Sandbox
+
+What the code enforces:
+
+- Rootless Podman, **non-root user**, `--cap-drop=ALL`,
+  `--security-opt=no-new-privileges`, memory / CPU / PID limits, base image pinned
+  by digest.
+- **A bounded filesystem.** Agents run `--read-only` with writable tmpfs totalling
+  256MB (`/battle` 192m, `/tmp` 32m, home 32m). Writing scripts, running them and
+  spawning background processes all work normally — `/battle` is the working
+  directory. What is bounded is the space: filling it costs an agent its own quota
+  rather than the host's disk, and running out is ruled as wrecking your own
+  environment.
+- **No writable host mount.** The battle log is container stdout, collected on the
+  host, so an agent cannot rewrite the record that judges it.
+- **Agents see only their own code.** `/app` carries `agent_harness.py` and
+  `modes.py` — not the scoring logic, the proxy, or the leaderboard.
+- The API key is held only by the proxy and never appears in an agent's
+  environment, the repo, or any log. Per-agent bearer tokens are never disclosed to
+  the opponent.
+- Teardown removes containers, pod and network on every exit path including
+  `SIGTERM`, and warns loudly if anything survives.
 
 What it does **not** enforce, stated plainly:
 
-- The proxy is a relay to OpenRouter. An agent can send arbitrary prompt text
-  out and read arbitrary text back within its request budget. "No egress" means
-  no *routable* network, not no information channel.
+- The proxy is a relay to OpenRouter. An agent can send arbitrary prompt text out
+  and read arbitrary text back within its budget. "No egress" means no *routable*
+  network, not no information channel.
 - The system prompt forbids escape attempts. That is a prompt, not a control.
-  Escape *attempts* are visible in the battle logs and are arguably the most
-  interesting data this benchmark produces.
 - Both agents run as the same uid in a shared PID namespace — that is the game.
-  A sufficiently determined agent could use same-uid process access against the
-  opponent's harness. Stealing the opponent's proxy token no longer wins,
-  though: budget exhaustion marks the match unrated rather than scoring it.
+  An agent's own bearer token is readable by its own shell, and cannot be hidden
+  from it: same uid, and it is in the harness's memory regardless. It is made
+  **useless** instead — spending it beyond your own turns is scored as a loss.
+- The narrowed `/app` mount is not a security boundary either. `agent_harness.py`
+  must stay readable for Python to run it. It removes an easy two-turn `cat` of the
+  scoring rules, which is what the first real matches showed models spending their
+  turns on.
+
+### Fairness
+
+- **A starting gun.** Containers are created sequentially, so one is ready
+  fractionally earlier. Each agent's *first* model call is held until both have
+  arrived, then released together. Waiting costs nothing and is never charged to a
+  time bank.
+- **Side shuffling**, on by default (`--no-shuffle-sides` to disable). Which model
+  plays `agent-a` is randomised per match and recorded in `result.json`.
+
+## Match artifacts
+
+Each match writes `matches/<id>/`:
+
+- `result.json` — winner, outcome, rated flag, per-agent token usage **and real
+  cost**, inference timings, time banks, exit codes, and the full arena
+  configuration (image digest, sampling params, limits) so a result can be audited
+  later
+- `events.jsonl` — the whole match as one ordered timeline
+- `agent-a/agent.jsonl`, `agent-b/agent.jsonl` — every model response and command,
+  captured from container stdout
+- `proxy/proxy.jsonl` — API request log with per-call timing, usage and cost
+
+The `OPENROUTER_API_KEY` is **never** written here. It lives in a `0600` file inside
+a `0700` private temp directory for the lifetime of the match, removed on every exit
+path including `SIGTERM`.
+
+## Flags
+
+`orchestrator.py` takes `--mode`, `--model-a/-b`, `--mock`, and overrides for the
+mode's own values: `--time-bank`, `--max-rounds`, `--move-timeout`, `--time-limit`,
+`--max-steps`, `--max-requests`. An override that has no meaning in the chosen mode
+is **rejected**, not ignored — silently ignored flags are how benchmark configs rot.
+
+Also: `--max-tokens-budget`, `--max-tokens-per-call`, `--temperature`, `--seed`,
+`--command-timeout`, `--memory`, `--cpus`, `--pids-limit`, `--battle-size`,
+`--grace-seconds`, `--poll-interval`, `--startup-timeout`, `--build`, `--keep`,
+`--allow-degraded`, `--no-shuffle-sides`, `--unbounded-fs`, `--no-read-only-fs`,
+`--preflight`.
+
+`elo.py` takes `--matches-dir`, `--k`, `--min-games`, `--mode`, `--compare`,
+`--include-degraded`, `--include-mock`, `--include-legacy`, `--quiet`.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests
 ```
 
-189 tests covering the scoring rules, the mode table, the lockstep barrier, the time
-bank, request validation, credential disclosure, the event stream, and the command
-runner. No dependencies, no containers needed.
+293 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+bank, request validation, credential disclosure, the event stream, the sandbox
+properties, real-provider response shapes, and the command runner. No dependencies
+and no containers needed.
 
 ## Status
 
-Prototype. Tournaments with side swapping are implemented. Next steps:
-strategy analysis, a browser UI over events.jsonl, and a public
-leaderboard page.
+Working prototype, verified against real models. Every mechanism is built and
+tested; what it has **not** yet done is measure anything — every real match so far
+has been one model against itself.
+
+Next: a real multi-model tournament to produce the first comparative leaderboard,
+and a public leaderboard page.
 
 ## License
 

@@ -1,0 +1,17 @@
+FROM docker.io/library/python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        coreutils \
+        curl \
+        iproute2 \
+        iputils-ping \
+        netcat-openbsd \
+        nmap \
+        procps \
+        psmisc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /battle
+
+CMD ["bash"]

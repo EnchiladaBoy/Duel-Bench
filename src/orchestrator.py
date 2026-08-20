@@ -27,12 +27,15 @@ import hashlib
 import json
 import os
 import math
+import queue
+import random
 import secrets
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -124,6 +127,136 @@ DEFAULT_MOCK_SCRIPTS = {
         "echo agent-b still alive",
     ],
 }
+
+
+class EventStream:
+    """Merge the match's three live sources into one ordered file on the HOST.
+
+    Every event already exists and is already flushed line by line - the harness
+    prints each record to container stdout, and the proxy flushes to a host bind
+    mount - but until now all of it was thrown away until teardown, which is
+    useless to anything watching a match in progress.
+
+    Deliberately host-side. The proxy's HTTP server is reachable by BOTH agents,
+    so serving a spectator feed from it would let an agent poll its opponent's
+    every command and its output, destroying reconnaissance as a skill. The
+    battle network is --internal, so containers cannot reach host loopback.
+
+    Best-effort by design: a dropped line costs a viewer one frame. The durable
+    audit record is still collect_logs() at teardown, which re-reads the whole
+    log and which an agent cannot rewrite.
+    """
+
+    ENVELOPE = ("v", "seq", "t", "src", "event")
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.queue = queue.Queue(maxsize=20000)
+        self.seq = 0
+        self.dropped = 0
+        self.started = time.monotonic()
+        self._stop = threading.Event()
+        self._procs = []
+        self._fh = self.path.open("a", encoding="utf-8")
+        self._writer = threading.Thread(target=self._drain, daemon=True)
+        self._writer.start()
+
+    def emit(self, src, event, **payload):
+        try:
+            self.queue.put_nowait((src, event, payload))
+        except queue.Full:
+            self.dropped += 1
+
+    def _drain(self):
+        while not (self._stop.is_set() and self.queue.empty()):
+            try:
+                src, event, payload = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self.seq += 1
+            record = {"v": 1, "seq": self.seq,
+                      "t": round(time.monotonic() - self.started, 3),
+                      "src": src, "event": event}
+            record.update(payload)
+            try:
+                self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self._fh.flush()
+            except (OSError, ValueError):
+                return
+
+    def _ingest(self, src, line):
+        line = line.strip()
+        if not line:
+            return
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        # The harness calls its type "kind", the proxy calls it "event".
+        event = record.pop("event", None) or record.pop("kind", None) or "log"
+        # The source's own clock is kept for skew analysis but never used for
+        # ordering: three containers, three unrelated wall clocks.
+        if "ts" in record:
+            record["src_ts"] = record.pop("ts")
+        for key in self.ENVELOPE:
+            record.pop(key, None)
+        self.emit(src, event, **record)
+
+    def follow_container(self, name, src):
+        try:
+            proc = subprocess.Popen(
+                [PODMAN, "logs", "-f", name], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError:
+            return
+        self._procs.append(proc)
+        threading.Thread(target=self._pump, args=(proc.stdout, src), daemon=True).start()
+
+    def _pump(self, stream, src):
+        try:
+            for line in stream:
+                self._ingest(src, line)
+        except (OSError, ValueError):
+            pass
+
+    def follow_file(self, path, src):
+        threading.Thread(target=self._tail, args=(Path(path), src), daemon=True).start()
+
+    def _tail(self, path, src):
+        pos = 0
+        while not self._stop.is_set():
+            try:
+                if path.exists():
+                    with path.open("r", errors="replace") as fh:
+                        fh.seek(pos)
+                        # readline(), not iteration: tell() is disabled inside a
+                        # for-loop over a text file, so the position never
+                        # advanced and every pass re-read the first line.
+                        while True:
+                            line = fh.readline()
+                            if not line or not line.endswith("\n"):
+                                break     # EOF, or a partial write to retry
+                            self._ingest(src, line)
+                            pos = fh.tell()
+            except OSError:
+                pass
+            self._stop.wait(0.3)
+
+    def close(self, linger=1.0):
+        deadline = time.time() + linger
+        while time.time() < deadline and not self.queue.empty():
+            time.sleep(0.05)
+        self._stop.set()
+        for proc in self._procs:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self._writer.join(timeout=2)
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
 
 class ArenaError(RuntimeError):
@@ -358,7 +491,8 @@ def heartbeat_state(url, timeout):
 
 
 def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
-            control_url, control_token, termination="wall_clock"):
+            control_url, control_token, termination="wall_clock",
+            events=None, roles=None):
     """Returns (winner, outcome, reason, duration, detail).
 
     Liveness for both agents is computed from ONE atomic snapshot before any
@@ -377,6 +511,7 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
     while time.time() < deadline:
         loop_start = time.time()
         states = inspect_containers(containers)
+        status = control_status(control_url, control_token) if control_url else {}
         now = time.time()
 
         down = {}
@@ -400,6 +535,25 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             elif name not in down and (now - last_ok[name]) >= grace_seconds:
                 down[name] = ("heartbeat", round(now - last_ok[name], 1))
 
+        if events:
+            # One record per poll carrying the whole scoreboard, so a viewer
+            # joining mid-match renders immediately without replaying the stream.
+            events.emit("orchestrator", "snapshot",
+                        elapsed=round(now - start, 1),
+                        round=(status or {}).get("round"),
+                        banks=(status or {}).get("banks"),
+                        agents={(roles or {}).get(n, n): {
+                            "alive": bool(states.get(n, {}).get("running")),
+                            "steps": (last_state.get(n) or {}).get("steps"),
+                            "commands_run": (last_state.get(n) or {}).get("commands_run"),
+                            "stop_reason": (last_state.get(n) or {}).get("stop_reason"),
+                        } for n in containers})
+        for name in down:
+            if events:
+                kind, info = down[name]
+                events.emit("orchestrator", "agent_down",
+                            agent=(roles or {}).get(name, name), how=kind, detail=info)
+
         if len(down) == 2:
             return "draw", "double_kill", "both agents down", round(now - start, 1), last_state
 
@@ -418,9 +572,8 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
                       else f"{loser} heartbeat silent for {info}s")
             return winner, "kill", reason, round(now - start, 1), last_state
 
-        # One call does double duty: proxy liveness probe AND the authoritative
-        # terminal signal. Same request count as the health probe it replaces.
-        status = control_status(control_url, control_token) if control_url else {}
+        # The control poll above does double duty: proxy liveness probe AND the
+        # authoritative terminal signal.
         if status is None:
             proxy_failures += 1
             if proxy_failures >= 3:
@@ -593,6 +746,10 @@ def parse_args():
     p.add_argument("--startup-timeout", type=int, default=90)
     p.add_argument("--build", action="store_true", help="force rebuild of the image")
     p.add_argument("--keep", action="store_true", help="don't tear down after the match")
+    p.add_argument("--no-shuffle-sides", action="store_true",
+                   help="do not randomise which model plays agent-a "
+                        "(agent-a's container is created first, a small but "
+                        "one-directional advantage)")
     p.add_argument("--fair", action="store_true",
                    help="deprecated alias for --mode untimed")
     p.add_argument("--move-timeout", type=float, default=None,
@@ -629,6 +786,16 @@ def main():
     args = parse_args()
     mode = resolve_mode(args)
 
+    # agent-a's container is created first, so being agent-a is a small but
+    # strictly one-directional edge. Randomising the assignment removes the
+    # systematic bias from every single match, without needing a tournament
+    # runner to play each pair both ways.
+    sides_shuffled = False
+    if not args.no_shuffle_sides and args.model_a != args.model_b:
+        if random.SystemRandom().random() < 0.5:
+            args.model_a, args.model_b = args.model_b, args.model_a
+            sides_shuffled = True
+
     # SIGTERM must unwind through the same cleanup path as Ctrl-C, or a killed
     # orchestrator leaks the whole pod and leaves the agents spending money.
     def _on_sigterm(signum, frame):
@@ -643,6 +810,13 @@ def main():
     match_dir = MATCHES / match_id
     for sub in ("agent-a", "agent-b", "proxy"):
         (match_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    events = EventStream(match_dir / "events.jsonl")
+    events.emit("orchestrator", "match_start", match_id=match_id,
+                mode=mode.name, mode_config=modes.to_dict(mode),
+                model_a=args.model_a, model_b=args.model_b,
+                sides_shuffled=sides_shuffled, mock=args.mock,
+                image=image, image_id=image_id)
 
     net_name = f"admatch-{match_id}"
     pod_name = f"admatch-pod-{match_id}"
@@ -755,10 +929,13 @@ def main():
             unrated_reason = "; ".join(degraded)
             print(f"[arena] WARNING degraded: {unrated_reason} — result will be unrated",
                   flush=True)
+        events.emit("orchestrator", "arena_ready", pid_shared=pid_shared,
+                    network_internal=network_internal, degraded=degraded or None)
 
         start_proxy(proxy_name, net_name, args.egress_network, image,
                     proxy_env_file, match_dir / "proxy", match_dir, proxy_host_port)
         resources["containers"].append(proxy_name)
+        events.follow_file(match_dir / "proxy" / "proxy.jsonl", "proxy")
 
         proxy_health_url = f"http://127.0.0.1:{proxy_host_port}/health"
         control_url = f"http://127.0.0.1:{proxy_host_port}/control/status"
@@ -775,6 +952,11 @@ def main():
         start_agent(cont_b, pod_name, image, "agent-b", "agent-a",
                     token_file_b, args.model_b, HB_PORT_B, HB_PORT_A, args, mode)
         resources["containers"] += [cont_a, cont_b]
+        # podman captures container stdout on the host, so this is a live view
+        # of the same bytes collect_logs() harvests at teardown - and one the
+        # agent cannot rewrite.
+        events.follow_container(cont_a, "agent-a")
+        events.follow_container(cont_b, "agent-b")
 
         hb_urls = {
             cont_a: f"http://127.0.0.1:{host_port_a}/health",
@@ -802,6 +984,7 @@ def main():
         winner, outcome, reason, duration, last_state = monitor(
             [cont_a, cont_b], hb_urls, mode.wall_clock, args.poll_interval,
             args.grace_seconds, control_url, control_token, mode.termination,
+            events, {cont_a: "agent-a", cont_b: "agent-b"},
         )
     except ArenaError as exc:
         winner, reason = "error", str(exc)
@@ -940,8 +1123,20 @@ def main():
                 "pod": pod_name, "network": net_name,
             },
             "logs": str(match_dir),
+            "events": "events.jsonl",
+            "side_assignment": {"agent-a": args.model_a, "agent-b": args.model_b,
+                                "shuffled": sides_shuffled},
         }
         (match_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+
+        events.emit("orchestrator", "match_end", winner=winner_role, outcome=outcome,
+                    reason=reason, duration=duration, rated=rated,
+                    unrated_reason=unrated_reason)
+        events.close()
+        if events.dropped:
+            print(f"[events] WARNING dropped {events.dropped} live events "
+                  f"(the durable log in agent-*/agent.jsonl is unaffected)", flush=True)
+
         teardown(resources, keep=args.keep)
 
     print(f"\n[result] winner={winner_role} reason={reason} duration={duration}s", flush=True)

@@ -56,6 +56,9 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(4 * 1024 * 1024)))
 # second upstream call - which with a time bank double-charges one move.
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "180"))
 BANK_GRACE = 5.0
+THINKING_TICK = float(os.environ.get("THINKING_TICK", "2"))
+STARTING_GUN = os.environ.get("STARTING_GUN", "1") == "1"
+STARTING_GUN_TIMEOUT = float(os.environ.get("STARTING_GUN_TIMEOUT", "60"))
 KEEP_RELEASES = 200
 
 LOCK = threading.Lock()
@@ -71,8 +74,9 @@ MOVE_SECONDS = {token: [] for token in TOKENS}
 EXHAUSTED = set()
 # An agent has at most one move in flight. Without this, K concurrent requests
 # on one token each pass the bank check before any of them charges, delivering
-# K x the bank's worth of inference for the price of one.
-IN_FLIGHT = set()
+# K x the bank's worth of inference for the price of one. Maps token -> the
+# monotonic time the move started, so the ticker can report live progress.
+IN_FLIGHT = {}
 MOCK_INDEX = {token: 0 for token in TOKENS}
 _LOG_FH = None
 
@@ -183,6 +187,65 @@ def barrier_join(token):
             "released": False,
             "joined": sorted(role_of(t) for t in barrier["joined"]),
         }
+
+
+# ------------------------------------------------------------ starting gun
+
+START_COND = threading.Condition()
+START_ARRIVED = set()
+START_STATE = {"released": not STARTING_GUN}
+
+
+def starting_gun(token):
+    """Hold each agent's FIRST model call until both have arrived, then release
+    them together.
+
+    Agent containers are created sequentially, so one is ready fractionally
+    earlier. In realtime that head start is a real edge, and to a spectator a
+    fight decided by container-start jitter looks rigged. Called before
+    admission and before the clock starts, so waiting here costs nothing and is
+    never charged to a time bank."""
+    with START_COND:
+        if START_STATE["released"]:
+            return
+        START_ARRIVED.add(token)
+        if len(START_ARRIVED) >= len(TOKENS):
+            START_STATE["released"] = True
+            START_COND.notify_all()
+            log({"event": "go", "agents": sorted(role_of(t) for t in START_ARRIVED)})
+            return
+        deadline = time.monotonic() + STARTING_GUN_TIMEOUT
+        while not START_STATE["released"]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # An opponent that never turns up must not hold the match.
+                START_STATE["released"] = True
+                START_COND.notify_all()
+                log({"event": "go", "reason": "timeout",
+                     "agents": sorted(role_of(t) for t in START_ARRIVED)})
+                break
+            START_COND.wait(min(remaining, 1.0))
+
+
+def thinking_ticker():
+    """Emit progress while a completion is in flight.
+
+    Without this a lockstep round is a long silence followed by two commands;
+    with it a viewer sees two clocks racing. Costs one record per agent per
+    tick and never touches the request path."""
+    while True:
+        time.sleep(THINKING_TICK)
+        with LOCK:
+            snapshot = [(t, started) for t, started in IN_FLIGHT.items()]
+        now = time.monotonic()
+        for token, started in snapshot:
+            record = {"event": "thinking", "agent": role_of(token),
+                      "elapsed": round(now - started, 1)}
+            if MODE.time_bank is not None and BANK_REMAINING.get(token) is not None:
+                # What the clock UI needs between move_start and move_end.
+                record["bank_remaining"] = round(
+                    max(0.0, BANK_REMAINING[token] - (now - started)), 1)
+            log(record)
 
 
 def retire_from_barrier(token):
@@ -504,6 +567,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             send_json(self, err[0], err[1])
             return
 
+        # Both agents are released together on their first move (below), so no
+        # state is held while waiting and the wait is never charged.
+        starting_gun(token)
+
         # Admission is decided in ONE critical section: bank exhaustion, the
         # request budget, and the one-move-in-flight rule. Splitting these let
         # concurrent requests on a single token each pass a nearly-empty bank.
@@ -517,7 +584,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 refusal, remaining = "proxy_budget", None
             else:
                 REQUEST_COUNT[token] += 1
-                IN_FLIGHT.add(token)
+                IN_FLIGHT[token] = time.monotonic()
                 refusal, remaining = None, BANK_REMAINING.get(token)
 
         if refusal == "time_bank_exhausted":
@@ -544,6 +611,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if MODE.time_bank is not None and remaining is not None:
             call_timeout = max(1.0, min(UPSTREAM_TIMEOUT, remaining + BANK_GRACE))
 
+        log({"event": "move_start", "agent": role_of(token),
+             "round": barrier["round"] if LOCKSTEP else None,
+             "bank_remaining": (round(remaining, 2) if remaining is not None else None)})
+
         # Timed here - after validation and admission, around the dispatch only -
         # and with a monotonic clock, so a wall-clock step can neither refund nor
         # steal a bank. Measured proxy-side because the harness runs in a
@@ -555,13 +626,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 if not API_KEY:
                     with LOCK:
-                        IN_FLIGHT.discard(token)
+                        IN_FLIGHT.pop(token, None)
                     send_json(self, 500, {"error": "proxy has no OPENROUTER_API_KEY"})
                     return
                 status, response = forward_openrouter(body, TOKENS[token], timeout=call_timeout)
         except Exception:
             with LOCK:
-                IN_FLIGHT.discard(token)
+                IN_FLIGHT.pop(token, None)
             raise
         elapsed = time.monotonic() - started
 
@@ -575,7 +646,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         usage = response.get("usage") if isinstance(response, dict) else None
         newly_exhausted = False
         with LOCK:
-            IN_FLIGHT.discard(token)
+            IN_FLIGHT.pop(token, None)
             if isinstance(usage, dict):
                 try:
                     TOKEN_USAGE[token] += int(usage.get("total_tokens") or 0)
@@ -662,6 +733,7 @@ def main():
         raise SystemExit("TOKENS_JSON is empty - no agents configured")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), ProxyHandler)
     server.daemon_threads = True
+    threading.Thread(target=thinking_ticker, daemon=True).start()
     log({
         "event": "proxy_start",
         "port": PORT,

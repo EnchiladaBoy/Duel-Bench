@@ -27,6 +27,7 @@ os.environ.update({
     "MOCK_SCRIPTS_JSON": json.dumps({TOK_A: ["ps"], TOK_B: ["ps"]}),
     "MAX_TOKENS_PER_CALL": "1024",
     "CONTROL_TOKEN": "cccc" * 8,
+    "STARTING_GUN": "0",
 })
 os.environ.update(modes.to_env(TEST_MODE))
 import model_proxy as mp  # noqa: E402
@@ -275,3 +276,47 @@ class TestHTTPSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStartingGun(unittest.TestCase):
+    """Agent containers are created sequentially, so one is ready fractionally
+    earlier. In realtime that head start is a real edge, and to a spectator a
+    fight decided by container-start jitter looks rigged."""
+
+    def setUp(self):
+        mp.START_ARRIVED.clear()
+        mp.START_STATE["released"] = False
+
+    def tearDown(self):
+        mp.START_STATE["released"] = True
+        with mp.START_COND:
+            mp.START_COND.notify_all()
+
+    def test_first_arrival_waits_for_the_opponent(self):
+        arrived = []
+        early = threading.Thread(
+            target=lambda: (mp.starting_gun(TOK_A), arrived.append("a")), daemon=True)
+        early.start()
+        time.sleep(0.3)
+        self.assertFalse(arrived, "the first agent should still be held at the line")
+        mp.starting_gun(TOK_B)
+        early.join(timeout=3)
+        self.assertEqual(arrived, ["a"], "both agents should be released together")
+
+    def test_once_released_the_gun_never_blocks_again(self):
+        mp.START_STATE["released"] = True
+        start = time.time()
+        mp.starting_gun(TOK_A)
+        self.assertLess(time.time() - start, 0.5)
+
+    def test_an_absent_opponent_cannot_hold_the_match_forever(self):
+        original = mp.STARTING_GUN_TIMEOUT
+        mp.STARTING_GUN_TIMEOUT = 0.5
+        try:
+            start = time.time()
+            mp.starting_gun(TOK_A)
+            elapsed = time.time() - start
+        finally:
+            mp.STARTING_GUN_TIMEOUT = original
+        self.assertGreater(elapsed, 0.3)
+        self.assertLess(elapsed, 3.0)

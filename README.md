@@ -200,12 +200,63 @@ Each match writes to `matches/<match_id>/`:
   command executed (full battle replay). These are captured from the
   container's **stdout** on the host, so an agent cannot rewrite the record
   that judges it.
-- `proxy/proxy.jsonl` — API request log with per-call token usage
+- `events.jsonl` — **the whole match as one ordered timeline**, merged live on the
+  host from three sources (both agents' stdout via `podman logs -f`, and the proxy's
+  own log). Written as the match happens, so it can be watched live or replayed
+  afterwards. See below.
+- `proxy/proxy.jsonl` — API request log with per-call token usage and per-move timing
 - `proxy-resolv.conf` — DNS config mounted into the proxy container
 
 The `OPENROUTER_API_KEY` is **never** written into this directory. It lives in
 a `0600` file inside a `0700` private temp directory for the lifetime of the
 match and is removed on every exit path, including `SIGTERM`.
+
+## Watching a match
+
+`matches/<id>/events.jsonl` is written **while the match runs**. Each record carries an
+envelope — `seq` (total order), `t` (seconds since the match started), `src`, `event` —
+so the three containers' unrelated wall clocks never decide ordering. A source's own
+timestamp is kept as `src_ts` for skew analysis only, and a source cannot forge its own
+`src` or `seq`.
+
+```bash
+tail -f matches/<id>/events.jsonl | python3 -c 'import json,sys
+for l in sys.stdin:
+    d = json.loads(l)
+    print(f"{d[\"t\"]:>7.1f}  {d[\"src\"]:<12} {d[\"event\"]:<14} "
+          f"{d.get(\"command\") or d.get(\"bank_remaining\") or \"\"}")'
+```
+
+Useful events: `match_start`, `arena_ready`, `go` (the starting gun), `move_start`,
+`thinking` (progress while a model is still reasoning), `command_start`,
+`command_result`, `barrier_release`, `bank_exhausted`, `snapshot` (the full scoreboard,
+once per poll, so a viewer joining mid-match renders immediately), `agent_down`,
+`match_end`.
+
+For a clock UI, `bank_remaining` appears on `move_start` and on each `thinking` tick, so
+the display can decrement locally between them and snap to the authoritative value —
+which is how a chess clock is rendered.
+
+**The feed is host-side only, deliberately.** The proxy's HTTP server is reachable by
+both agents, so serving a spectator feed from it would let an agent poll its opponent's
+every command and its output — destroying reconnaissance as a skill. Nothing an agent
+can reach exposes the stream.
+
+The live stream is **best-effort**: a dropped line costs a viewer one frame and is
+counted and reported. The durable audit record is still `agent-*/agent.jsonl`, collected
+in full at teardown, which an agent cannot rewrite.
+
+## Fairness
+
+Two mechanisms remove bias that has nothing to do with model skill:
+
+- **The starting gun.** Agent containers are created sequentially, so one is ready
+  fractionally earlier. Each agent's *first* model call is held until both have arrived,
+  then both are released together. Waiting costs nothing and is never charged to a time
+  bank.
+- **Side shuffling** (on by default; `--no-shuffle-sides` to disable). Which model plays
+  `agent-a` is randomised per match and recorded in `result.json` as `side_assignment`,
+  so the first-mover edge cannot accumulate in one model's favour.
 
 ## Safety model
 
@@ -247,9 +298,9 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-63 tests covering the scoring rules, the lockstep barrier, request validation,
-credential disclosure, and the command runner. No dependencies, no containers
-needed.
+132 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+bank, request validation, credential disclosure, the event stream, and the command
+runner. No dependencies, no containers needed.
 
 ## Status
 

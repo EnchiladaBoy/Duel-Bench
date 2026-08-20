@@ -22,7 +22,7 @@ BANK = 2.0
 
 
 _ENV_KEYS = (modes.ENV_VAR, "MOCK_SLEEP_JSON", "TOKENS_JSON", "ROLES_JSON",
-             "MOCK_SCRIPTS_JSON", "MOCK_BACKEND", "PROXY_LOG")
+             "MOCK_SCRIPTS_JSON", "MOCK_BACKEND", "PROXY_LOG", "STARTING_GUN")
 
 
 def setUpModule():
@@ -37,6 +37,7 @@ def setUpModule():
         "MOCK_BACKEND": "1",
         "PROXY_LOG": "",
         "MOCK_SLEEP_JSON": json.dumps({TOK_A: [0.6, 0.6, 0.6, 0.6], TOK_B: 0.05}),
+        "STARTING_GUN": "0",
     })
     os.environ.update(modes.to_env(modes.resolve("time-bank", time_bank=BANK)))
     importlib.reload(mp)

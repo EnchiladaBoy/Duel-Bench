@@ -113,6 +113,7 @@ class TestModeResolution(unittest.TestCase):
     class _Args:
         mode = "realtime"
         fair = False
+        no_shuffle_sides = False
         time_limit = max_rounds = move_timeout = None
         time_bank = max_steps = max_requests = None
 
@@ -128,6 +129,12 @@ class TestModeResolution(unittest.TestCase):
         args = self._Args()
         args.fair = True
         self.assertEqual(orch.resolve_mode(args).name, "untimed")
+
+    def test_sides_are_shuffled_by_default(self):
+        # agent-a's container is created first, so being agent-a is a small but
+        # strictly one-directional edge.
+        args = self._Args()
+        self.assertFalse(getattr(args, "no_shuffle_sides", False))
 
     def test_overrides_apply(self):
         args = self._Args()

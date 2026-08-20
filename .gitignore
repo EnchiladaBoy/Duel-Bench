@@ -1,4 +1,5 @@
 matches/
+tournaments/
 __pycache__/
 *.pyc
 .env

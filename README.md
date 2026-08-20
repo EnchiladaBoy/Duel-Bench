@@ -295,6 +295,39 @@ Two mechanisms remove bias that has nothing to do with model skill:
   `agent-a` is randomised per match and recorded in `result.json` as `side_assignment`,
   so the first-mover edge cannot accumulate in one model's favour.
 
+## Tournaments
+
+A single match carries a side bias and no statistical weight. `tournament.py` plays every
+pair **both ways**, repeatedly, in each mode:
+
+```bash
+# Price it before spending anything
+python3 src/tournament.py --models openai/gpt-4o-mini,anthropic/claude-3.5-haiku \
+    --modes time-bank,realtime --games 3 --estimate
+
+# Run it, with a hard ceiling on total spend
+python3 src/tournament.py --models a,b,c --modes time-bank --games 3 \
+    --run --max-total-tokens 2000000
+
+# Pick up exactly where it stopped
+python3 src/tournament.py --resume tournaments/<id>
+```
+
+- `--games N` means N repeats per pair **per direction**, so `--games 3` is 6 matches
+  per pair per mode.
+- The schedule is written up front and updated after every match, so a run survives a
+  provider outage or a Ctrl-C. A failed match is retried once, then abandoned and
+  reported — never silently dropped.
+- Cost estimates are learned from your own finished matches when any exist, rather than
+  guessed. Mock matches are excluded from that average, since they cost nothing.
+- The runner passes `--no-shuffle-sides`: it is assigning sides deliberately, one pairing
+  each way, and re-randomising them would destroy the balance.
+
+**Why both directions matter.** In a mock tournament where the scripted agent-a always
+wins, side-swapping puts the two models at 1499 and 1501 — dead even. The same scripts
+run without swapping sit at 1546 and 1454: a 92-point gap created entirely by which
+container was started first.
+
 ## Safety model
 
 What the code actually enforces:
@@ -335,15 +368,15 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-153 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+166 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, and the command
 runner. No dependencies, no containers needed.
 
 ## Status
 
-Prototype. Next steps: multi-match tournaments **with side swapping** (agent-a
-starts first, so pairs must be run both ways before any rating is meaningful),
-strategy replay/analysis, and a public leaderboard page.
+Prototype. Tournaments with side swapping are implemented. Next steps:
+strategy replay/analysis, a live match viewer over events.jsonl, and a
+public leaderboard page.
 
 ## License
 

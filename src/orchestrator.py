@@ -1181,9 +1181,23 @@ def main():
             # Refuse in three seconds rather than discovering it as 15 model
             # errors, zero commands and a meaningless draw - which is what the
             # one historical real match cost.
-            report = control_get(f"http://127.0.0.1:{proxy_host_port}/control/egress",
-                                 control_token, timeout=30) or {}
-            events.emit("orchestrator", "egress_check", **report)
+            egress_url = f"http://127.0.0.1:{proxy_host_port}/control/egress"
+            report = control_get(egress_url, control_token, timeout=30)
+            if report is None:
+                # Retry once: this probe runs seconds after the proxy bound its
+                # port, and a transient miss here aborts a match that would have
+                # been fine. One real tournament match was lost to exactly this.
+                time.sleep(2)
+                report = control_get(egress_url, control_token, timeout=30)
+            events.emit("orchestrator", "egress_check", **(report or {"ok": False}))
+            if report is None:
+                # NOT the same as "egress is broken": we could not ask. Saying
+                # "stage: None" taught nobody anything - the staged reporting
+                # exists precisely to name which step failed.
+                raise ArenaError(
+                    "could not reach the proxy's own control endpoint to verify "
+                    "egress (the proxy answered /health but not /control/egress). "
+                    "Run --preflight to diagnose; nothing was spent.")
             if not report.get("ok"):
                 raise ArenaError(
                     f"the proxy container cannot reach the model API "

@@ -647,9 +647,9 @@ def summarize_proxy_log(match_dir):
     The proxy is the only clock an agent cannot reach, so this is the
     authoritative record of how long each model actually thought."""
     path = match_dir / "proxy" / "proxy.jsonl"
-    usage, moves = {}, {}
+    usage, moves, cost = {}, {}, {}
     if not path.exists():
-        return usage, {}
+        return usage, {}, {}
     for line in path.read_text(errors="replace").splitlines():
         try:
             rec = json.loads(line)
@@ -662,8 +662,19 @@ def summarize_proxy_log(match_dir):
                                          "completion_tokens": 0, "total_tokens": 0})
         entry["requests"] += 1
         used = rec.get("usage") or {}
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        for key in ("prompt_tokens", "completion_tokens"):
             entry[key] += int(used.get(key) or 0)
+        # A provider that omits total_tokens would otherwise never advance the
+        # budget, leaving the spend cap silently unbounded.
+        entry["total_tokens"] += int(
+            used.get("total_tokens")
+            or (int(used.get("prompt_tokens") or 0)
+                + int(used.get("completion_tokens") or 0)))
+        # Tokens are not money: the same count costs an order of magnitude more
+        # on one model than another, so a token cap is not a spend cap.
+        # OpenRouter returns the real figure and it was being discarded.
+        if used.get("cost") is not None:
+            cost[agent] = round(cost.get(agent, 0.0) + float(used["cost"]), 8)
         elapsed = rec.get("elapsed_seconds")
         if elapsed is not None and rec.get("status") == 200:
             moves.setdefault(agent, []).append(float(elapsed))
@@ -676,7 +687,9 @@ def summarize_proxy_log(match_dir):
             "p50": _percentile(values, 0.5),
             "max": round(max(values), 3),
         }
-    return usage, inference
+    if cost:
+        cost["total"] = round(sum(v for k, v in cost.items() if k != "total"), 8)
+    return usage, inference, cost
 
 
 def teardown(resources, keep=False):
@@ -941,6 +954,7 @@ def main():
     token_file_a = token_file_b = None
     resources = {"containers": [], "pod": None, "network": None}
     winner = reason = outcome = None
+    cost_usd = {}
     bank_summary = {}
     control_url = None
     duration = 0.0
@@ -1196,7 +1210,7 @@ def main():
                 outcome = "protocol_forfeit"
 
         winner_role = {cont_a: "agent-a", cont_b: "agent-b"}.get(winner, winner)
-        usage, inference = summarize_proxy_log(match_dir)
+        usage, inference, cost_usd = summarize_proxy_log(match_dir)
         result = {
             "schema_version": 2,
             "match_id": match_id,
@@ -1235,6 +1249,7 @@ def main():
             "forfeits": final.get("forfeits") or {},
             "usage": usage,
             "inference_seconds": inference,
+            "cost_usd": cost_usd,
             "time_bank": bank_summary,
             "containers": {
                 "agent_a": cont_a, "agent_b": cont_b, "proxy": proxy_name,
@@ -1263,8 +1278,12 @@ def main():
               f"(this match will not affect the leaderboard)", flush=True)
     if usage:
         for role, u in sorted(usage.items()):
+            spent = cost_usd.get(role)
+            money = f", ${spent:.6f}" if spent is not None else ""
             print(f"[usage] {role}: {u['requests']} requests, "
-                  f"{u['total_tokens']} tokens", flush=True)
+                  f"{u['total_tokens']} tokens{money}", flush=True)
+    if cost_usd.get("total"):
+        print(f"[usage] total: ${cost_usd['total']:.6f}", flush=True)
     print(f"[result] logs: {match_dir}", flush=True)
     if winner_role in ("agent-a", "agent-b"):
         wmodel = args.model_a if winner_role == "agent-a" else args.model_b

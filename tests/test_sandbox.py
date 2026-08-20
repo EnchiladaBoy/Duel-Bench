@@ -86,10 +86,14 @@ class TestExistingHardeningKept(unittest.TestCase):
     def test_privilege_escalation_is_still_blocked(self):
         self.assertIn('"no-new-privileges"', SOURCE)
 
-    def test_agents_still_have_no_writable_host_mount(self):
+    def test_agent_log_path_is_unbound_in_classic_and_bounded_in_warfare(self):
         # The battle log is container stdout, collected on the host, so an agent
-        # cannot rewrite the record that judges it.
-        self.assertIn('"LOG_PATH": ""', SOURCE)
+        # cannot rewrite the record that judges it. In warfare bulwark mode the
+        # harness additionally keeps a bounded tmpfs copy so a respawned
+        # supervisor can recover its own conversation - nothing on the host is
+        # writable either way.
+        self.assertIn('"/battle/agent.jsonl" if warf.process_bulwark else ""',
+                      SOURCE)
 
     def test_resource_limits_are_still_applied(self):
         for flag in ("--memory", "--cpus", "--pids-limit"):

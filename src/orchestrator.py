@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import modes
+import warfare
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
@@ -480,7 +481,7 @@ def start_proxy(name, network, egress_network, image, env_file, log_dir,
     return True
 
 
-AGENT_VISIBLE = ("agent_harness.py", "modes.py")
+AGENT_VISIBLE = ("agent_harness.py", "modes.py", "warfare.py")
 
 
 def stage_agent_src(match_dir):
@@ -504,7 +505,7 @@ def stage_agent_src(match_dir):
 
 
 def start_agent(name, pod, image, role, opponent, token_file, model,
-                hb_port, opp_hb_port, args, mode, agent_src):
+                hb_port, opp_hb_port, args, mode, warf, agent_src):
     env = {
         "AGENT_ROLE": role,
         "OPPONENT_ROLE": opponent,
@@ -518,14 +519,17 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
         "OPPONENT_HEARTBEAT_PORT": str(opp_hb_port),
         "COMMAND_TIMEOUT": str(args.command_timeout),
         "BATTLE_DIR": "/battle",
-        # No host bind mount for logs: the battle log is the container's stdout,
-        # which the agent's own shell cannot rewrite. Collected at teardown.
-        "LOG_PATH": "",
+        # No host bind mount for logs in classic mode: stdout is collected on
+        # the host so the agent cannot rewrite the record that judges it. In
+        # warfare bulwark mode we also keep a path copy so a respawned
+        # supervisor can recover its conversation.
+        "LOG_PATH": "/battle/agent.jsonl" if warf.process_bulwark else "",
     }
     # The rules are identical for both agents, so shipping them in the
     # environment is safe (unlike the bearer token, which is a mounted file
     # because the agents share a PID namespace). Both players should know them.
     env.update(modes.to_env(mode))
+    env.update(warfare.to_env(warf))
     cmd = [
         PODMAN, "run", "-d", "--name", name, "--pod", pod,
         "--memory", args.memory,
@@ -534,6 +538,9 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
     ]
+    if warf.process_bulwark:
+        # -w puts the cwd at /app so `python -m agent_harness` can find it.
+        cmd += ["-w", "/app"]
     if not args.unbounded_fs:
         # An agent still writes code, runs it, and spawns background processes:
         # /battle is its working directory and stays writable. What changes is
@@ -561,8 +568,14 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
         "-v", f"{agent_src}:/app:ro,z",
         "-v", f"{token_file}:/run/agent-token:ro,z",
         image,
-        "python", "/app/agent_harness.py", "--agent", role,
     ]
+    if warf.process_bulwark:
+        # python -m hides the ".py" path from /proc/<pid>/cmdline, so a
+        # `pkill -f agent_harness.py` style script no longer matches either
+        # the heartbeat parent or the game supervisor.
+        cmd += ["python", "-m", "agent_harness", "--agent", role]
+    else:
+        cmd += ["python", "/app/agent_harness.py", "--agent", role]
     run_cmd(cmd)
 
 
@@ -980,6 +993,11 @@ def parse_args():
                         "one-directional advantage)")
     p.add_argument("--fair", action="store_true",
                    help="deprecated alias for --mode untimed")
+    p.add_argument("--classic", action="store_true",
+                   help="disable the warfare preset: single-process harness, "
+                        "original prompt, one-shot heartbeat. Preserves "
+                        "byte-identical behavior for comparing with archived "
+                        "matches.")
     p.add_argument("--move-timeout", type=float, default=None,
                    help="override the mode's per-move deadline (seconds)")
     p.add_argument("--mock-delay-a", type=float, default=0.0)
@@ -1013,6 +1031,7 @@ def resolve_mode(args):
 def main():
     args = parse_args()
     mode = resolve_mode(args)
+    warf = warfare.resolve(not args.classic)
 
     # agent-a's container is created first, so being agent-a is a small but
     # strictly one-directional edge. Randomising the assignment removes the
@@ -1113,6 +1132,7 @@ def main():
             "PROXY_LOG=/logs/proxy.jsonl",
             f"PROXY_PORT={PROXY_CONTAINER_PORT}",
         ] + [f"{k}={v}" for k, v in modes.to_env(mode).items()]
+        env_lines += [f"{k}={v}" for k, v in warfare.to_env(warf).items()]
         if not args.mock:
             api_key = os.environ.get("OPENROUTER_API_KEY", "")
             if not api_key:
@@ -1210,9 +1230,9 @@ def main():
         # agent-a does not get a head start proportional to agent-b's startup.
         agent_src = stage_agent_src(match_dir)
         start_agent(cont_a, pod_name, image, "agent-a", "agent-b",
-                    token_file_a, args.model_a, HB_PORT_A, HB_PORT_B, args, mode, agent_src)
+                    token_file_a, args.model_a, HB_PORT_A, HB_PORT_B, args, mode, warf, agent_src)
         start_agent(cont_b, pod_name, image, "agent-b", "agent-a",
-                    token_file_b, args.model_b, HB_PORT_B, HB_PORT_A, args, mode, agent_src)
+                    token_file_b, args.model_b, HB_PORT_B, HB_PORT_A, args, mode, warf, agent_src)
         resources["containers"] += [cont_a, cont_b]
         # podman captures container stdout on the host, so this is a live view
         # of the same bytes collect_logs() harvests at teardown - and one the
@@ -1395,6 +1415,7 @@ def main():
                 "battle_size": None if args.unbounded_fs else args.battle_size,
                 "read_only_fs": bool(args.read_only_fs and not args.unbounded_fs),
                 "wreck_observe_only": bool(args.wreck_observe_only),
+                "warfare": warfare.to_dict(warf),
             },
             "exit_codes": exit_codes,
             "commands_run": commands,

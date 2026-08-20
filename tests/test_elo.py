@@ -181,6 +181,21 @@ class TestModePartitioning(unittest.TestCase):
         self.assertEqual(elo.pool_of({}), elo.LEGACY_POOL)
         self.assertEqual(elo.pool_of({"mode": "time-bank"}), "time-bank")
 
+    def test_warfare_and_classic_arenas_are_never_pooled(self):
+        write_match(self.root, "warfare-match", mode="untimed",
+                    arena={"warfare": {"enabled": True}})
+        write_match(self.root, "classic-match", mode="untimed",
+                    arena={"warfare": {"enabled": False}})
+        pools = elo.partition(elo.load_results(self.root)[0])
+        self.assertIn("untimed (warfare)", pools)
+        self.assertIn("untimed (classic)", pools)
+        self.assertNotIn("untimed", pools)
+
+    def test_a_result_without_the_warfare_field_stays_in_the_mode_pool(self):
+        write_match(self.root, "m1", mode="untimed")
+        pools = elo.partition(elo.load_results(self.root)[0])
+        self.assertIn("untimed", pools)
+
     def test_token_usage_is_reported_per_model(self):
         write_match(self.root, "m1", usage={"agent-a": {"total_tokens": 400},
                                             "agent-b": {"total_tokens": 200}})

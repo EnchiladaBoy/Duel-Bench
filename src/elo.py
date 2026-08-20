@@ -29,8 +29,14 @@ LEGACY_POOL = "legacy"
 
 def pool_of(data):
     """Which leaderboard a result belongs on. Modes are never pooled: they
-    impose different rules, so their ratings are not comparable."""
-    return data.get("mode") or LEGACY_POOL
+    impose different rules, so their ratings are not comparable. Warfare and
+    classic arenas are never pooled either - the two rule-sets reward very
+    different behavior."""
+    mode = data.get("mode") or LEGACY_POOL
+    warfare_info = (data.get("arena") or {}).get("warfare")
+    if warfare_info is None:
+        return mode
+    return mode + (" (warfare)" if warfare_info.get("enabled") else " (classic)")
 
 
 def partition(results):

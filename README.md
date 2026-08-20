@@ -331,10 +331,11 @@ path including `SIGTERM`.
 
 ## Flags
 
-`orchestrator.py` takes `--mode`, `--model-a/-b`, `--mock`, and overrides for the
-mode's own values: `--time-bank`, `--max-rounds`, `--move-timeout`, `--time-limit`,
-`--max-steps`, `--max-requests`. An override that has no meaning in the chosen mode
-is **rejected**, not ignored — silently ignored flags are how benchmark configs rot.
+`orchestrator.py` takes `--mode`, `--model-a/-b`, `--mock`, `--classic`,
+and overrides for the mode's own values: `--time-bank`, `--max-rounds`,
+`--move-timeout`, `--time-limit`, `--max-steps`, `--max-requests`. An override
+that has no meaning in the chosen mode is **rejected**, not ignored — silently
+ignored flags are how benchmark configs rot.
 
 Also: `--max-tokens-budget`, `--max-tokens-per-call`, `--temperature`, `--seed`,
 `--command-timeout`, `--memory`, `--cpus`, `--pids-limit`, `--battle-size`,
@@ -412,26 +413,40 @@ The practical consequence: **lockstep modes are noisier than they look.** More
 than half of those matches contribute 0.5/0.5 and carry little ranking signal, so
 they need more games than realtime to separate two models.
 
-A likely cause is the system prompt, which tells both agents exactly how to
-identify and kill each other — the shared PID namespace, the command-line
-pattern, both heartbeat URLs. It makes matches decisive fast, but both models
-converge on `kill -9 <pid>` within two turns, which may leave little room for
-strategy.
+A likely cause was the system prompt, which handed both agents the exact
+kill pattern — the shared PID namespace, the exact command line, both heartbeat
+URLs. Both models converged on `kill -9 <pid>` within two turns. Worse, the
+heartbeat hint pointed at `localhost`, which is wrong in a shared network
+namespace and quietly discouraged every genuine network attack. The **warfare**
+preset (default since the redesign; `--classic` reproduces the old arena
+byte-identically) corrects all three facts:
+
+- **PID-hint removal and a correct network hint** replace the kill plan:
+  reconnaissance is now a real skill, and `pkill -f agent_harness.py` no
+  longer matches anything.
+- **The bulwark** runs the game loop in a respawned child, so the one-shot
+  kill only claims a supervisor the parent immediately replaces. The
+  opponent's heartbeat stays up on the parent's PID; recovery replays the
+  conversation from the durable `/battle/agent.jsonl`.
+- **The heartbeat retries its bind** (8 attempts), so `nc -l` port-squatting
+  is an upkeep cost rather than a one-turn kill.
 
 Wreck detection has **never once ruled a match**: no real match has ended in
 `wrecked`. That is the kind of evidence it needs before being trusted to decide
 one — with the caveat that the match record did not, until now, state whether the
 detector was even allowed to rule. `result.json` now records
-`arena.wreck_observe_only`, so a future "it never fired" is a claim you can check
-rather than take on faith.
+`arena.wreck_observe_only` and `arena.warfare`, so a future "it never fired" is
+a claim you can check rather than take on faith.
 
 ## Status
 
 Working prototype, verified end to end against real models and producing real
-leaderboards. Next: a third model with a real speed/capability gap, which is the
-only way to get a cross-mode correlation that means anything, and a public
-leaderboard page.
+leaderboards. The warfare preset is now the default arena; old match records stay
+comparable under `--classic`. Next: a third model with a real speed/capability
+gap, which is the only way to get a cross-mode correlation that means anything,
+and a public leaderboard page.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+

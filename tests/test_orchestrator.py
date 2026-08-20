@@ -232,7 +232,8 @@ class TestAgentSourceMount(unittest.TestCase):
     """Agents get their own code and the rules, not the scoring logic."""
 
     def test_only_the_harness_and_the_rules_are_visible(self):
-        self.assertEqual(sorted(orch.AGENT_VISIBLE), ["agent_harness.py", "modes.py"])
+        self.assertEqual(sorted(orch.AGENT_VISIBLE),
+                         ["agent_harness.py", "modes.py", "warfare.py"])
 
     def test_the_scoring_and_proxy_source_are_not_staged(self):
         for hidden in ("orchestrator.py", "model_proxy.py", "elo.py",
@@ -244,7 +245,7 @@ class TestAgentSourceMount(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             staged = orch.stage_agent_src(tmp)
             self.assertEqual(sorted(p.name for p in staged.iterdir()),
-                             ["agent_harness.py", "modes.py"])
+                             ["agent_harness.py", "modes.py", "warfare.py"])
 
     def test_staged_harness_can_still_import_modes(self):
         # Both live in one directory, so sys.path[0] resolves the import exactly
@@ -254,6 +255,13 @@ class TestAgentSourceMount(unittest.TestCase):
             staged = orch.stage_agent_src(tmp)
             self.assertTrue((staged / "modes.py").exists())
             self.assertIn("import modes", (staged / "agent_harness.py").read_text())
+
+    def test_staged_harness_can_still_import_warfare(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = orch.stage_agent_src(tmp)
+            self.assertTrue((staged / "warfare.py").exists())
+            self.assertIn("import warfare", (staged / "agent_harness.py").read_text())
 
 
 class TestWreckDetection(unittest.TestCase):

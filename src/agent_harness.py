@@ -625,7 +625,12 @@ def main():
                         # and let the opponent play out its remaining bank.
                         idle("time_bank_exhausted")
                     if kind == "proxy_budget":
-                        idle("budget_exhausted", fatal=True)
+                        # Reaching a limit by playing is not breaking yourself:
+                        # this now behaves exactly like running out of steps or
+                        # emptying a time bank - stop acting, stay alive, stay
+                        # killable. Making it fatal handed a losing agent a way
+                        # to VOID the match by burning its own budget.
+                        idle("budget_exhausted")
                 time.sleep(2 * attempt)
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}"

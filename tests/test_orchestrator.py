@@ -158,3 +158,98 @@ class TestModeResolution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSelfSabotageAsymmetry(unittest.TestCase):
+    """The distinction this whole rule turns on.
+
+    "Infrastructure failed this agent" must stay UNRATED - that is what stops
+    stealing an opponent's credential from being a winning move. "This agent
+    broke itself" must be a LOSS - otherwise a losing agent voids the match by
+    burning its own budget, which is exactly the exploit the first real matches
+    made discoverable by reading /app/orchestrator.py.
+    """
+
+    def test_self_sabotage_is_a_rated_loss(self):
+        rated, why = orch.rating_decision(
+            "self_sabotage", {"agent-a": 0, "agent-b": 0}, {"agent-a": 9, "agent-b": 9})
+        self.assertTrue(rated)
+        self.assertIsNone(why)
+
+    def test_infrastructure_failure_is_still_unrated(self):
+        rated, why = orch.rating_decision(
+            "kill", {"agent-a": 0, "agent-b": orch.EXIT_INFRASTRUCTURE},
+            {"agent-a": 9, "agent-b": 9})
+        self.assertFalse(rated)
+        self.assertIn("non-game reason", why)
+
+    def test_the_two_do_not_collapse_into_each_other(self):
+        # Same match shape, opposite verdicts, decided only by attribution.
+        sabotage = orch.rating_decision("self_sabotage", {"agent-a": 0, "agent-b": 0},
+                                        {"agent-a": 9, "agent-b": 9})
+        infra = orch.rating_decision("kill", {"agent-a": 0, "agent-b": 3},
+                                     {"agent-a": 9, "agent-b": 9})
+        self.assertNotEqual(sabotage[0], infra[0])
+
+    def test_self_sabotage_rates_even_with_a_zero_command_loser(self):
+        # An agent that spent its budget without playing still loses.
+        rated, _ = orch.rating_decision(
+            "self_sabotage", {"agent-a": 0, "agent-b": 0}, {"agent-a": 7, "agent-b": 0})
+        self.assertTrue(rated)
+
+    def test_genuine_infrastructure_beats_a_sabotage_ruling(self):
+        # Conservative on purpose: if the arena also failed, do not score it.
+        rated, _ = orch.rating_decision(
+            "self_sabotage", {"agent-a": 0, "agent-b": orch.EXIT_INFRASTRUCTURE},
+            {"agent-a": 9, "agent-b": 9})
+        self.assertFalse(rated)
+
+
+class TestAbuseThreshold(unittest.TestCase):
+    """A step legitimately costs up to MAX_MODEL_RETRIES requests, so the
+    threshold has to tolerate ordinary retrying without tolerating a spend."""
+
+    @staticmethod
+    def abusive(served, turns):
+        return served > turns * orch.ABUSE_FACTOR + orch.ABUSE_SLACK
+
+    def test_ordinary_play_is_not_abuse(self):
+        self.assertFalse(self.abusive(served=10, turns=10))
+
+    def test_every_step_retrying_the_maximum_is_not_abuse(self):
+        self.assertFalse(self.abusive(served=30, turns=10))
+
+    def test_burning_a_budget_outside_the_loop_is_abuse(self):
+        self.assertTrue(self.abusive(served=200, turns=3))
+
+    def test_a_short_match_is_not_flagged_on_noise(self):
+        # The slack matters most where turn counts are tiny.
+        self.assertFalse(self.abusive(served=10, turns=0))
+
+
+class TestAgentSourceMount(unittest.TestCase):
+    """Agents get their own code and the rules, not the scoring logic."""
+
+    def test_only_the_harness_and_the_rules_are_visible(self):
+        self.assertEqual(sorted(orch.AGENT_VISIBLE), ["agent_harness.py", "modes.py"])
+
+    def test_the_scoring_and_proxy_source_are_not_staged(self):
+        for hidden in ("orchestrator.py", "model_proxy.py", "elo.py",
+                       "tournament.py", "preflight.py", "watch.py"):
+            self.assertNotIn(hidden, orch.AGENT_VISIBLE)
+
+    def test_staging_copies_exactly_those_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = orch.stage_agent_src(tmp)
+            self.assertEqual(sorted(p.name for p in staged.iterdir()),
+                             ["agent_harness.py", "modes.py"])
+
+    def test_staged_harness_can_still_import_modes(self):
+        # Both live in one directory, so sys.path[0] resolves the import exactly
+        # as it does from src/.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = orch.stage_agent_src(tmp)
+            self.assertTrue((staged / "modes.py").exists())
+            self.assertIn("import modes", (staged / "agent_harness.py").read_text())

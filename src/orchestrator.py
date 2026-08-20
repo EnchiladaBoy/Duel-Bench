@@ -30,6 +30,7 @@ import math
 import queue
 import random
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -65,7 +66,7 @@ UNRATABLE_OUTCOMES = frozenset({
 })
 # Outcomes decided by one agent going down: rated regardless of how little the
 # loser managed to do. Being killed before you act is a legitimate way to lose.
-DECISIVE_OUTCOMES = frozenset({"kill", "protocol_forfeit"})
+DECISIVE_OUTCOMES = frozenset({"kill", "protocol_forfeit", "self_sabotage"})
 # Outcomes where nobody went down, so the match only means something if both
 # agents actually engaged.
 DRAWN_OUTCOMES = frozenset({"double_kill", "rounds_complete", "banks_exhausted", "time_limit"})
@@ -74,8 +75,14 @@ DRAWN_OUTCOMES = frozenset({"double_kill", "rounds_complete", "banks_exhausted",
 # alive and killable". When BOTH agents report one, the match is over: waiting
 # for the runaway guard would just produce a slow, semantically mushy draw.
 STOPPED_REASONS = frozenset({
-    "max_steps_reached", "rounds_complete", "time_bank_exhausted",
+    "max_steps_reached", "rounds_complete", "time_bank_exhausted", "budget_exhausted",
 })
+
+# An agent whose credential served far more requests than it took turns spent it
+# outside its own harness loop. Every token-disclosure path was closed in the
+# audit, so that is the agent itself - and it is a deliberate act, not a fault.
+# Generous, because a step legitimately costs up to MAX_MODEL_RETRIES requests.
+ABUSE_FACTOR, ABUSE_SLACK = 4, 10
 # Which drawn outcome a mutual stop corresponds to, by termination rule.
 STOP_OUTCOME = {"rounds": "rounds_complete", "banks": "banks_exhausted",
                 "wall_clock": "time_limit"}
@@ -434,8 +441,31 @@ def start_proxy(name, network, egress_network, image, env_file, log_dir,
     return True
 
 
+AGENT_VISIBLE = ("agent_harness.py", "modes.py")
+
+
+def stage_agent_src(match_dir):
+    """Copy just what an agent needs at runtime into a per-match directory.
+
+    The first real matches showed models reading the arena's own source - not
+    only their own harness but orchestrator.py, grepping it for DECISIVE, DRAWN
+    and stop_reason. They were studying how they are scored. An agent needs its
+    own code and the rules it is already told; it does not need the scoring
+    logic, the proxy, the leaderboard or the tournament runner.
+
+    Staged as a directory rather than individual file mounts so `import modes`
+    still resolves from the same sys.path[0], and so it stays a single ro,z
+    shared-label mount - a private :Z relabel here once gave one agent access
+    and denied the other."""
+    staged = Path(match_dir) / "agent-src"
+    staged.mkdir(parents=True, exist_ok=True)
+    for name in AGENT_VISIBLE:
+        shutil.copy2(SRC / name, staged / name)
+    return staged
+
+
 def start_agent(name, pod, image, role, opponent, token_file, model,
-                hb_port, opp_hb_port, args, mode):
+                hb_port, opp_hb_port, args, mode, agent_src):
     env = {
         "AGENT_ROLE": role,
         "OPPONENT_ROLE": opponent,
@@ -468,7 +498,7 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
     cmd += [
-        "-v", f"{SRC}:/app:ro,z",
+        "-v", f"{agent_src}:/app:ro,z",
         "-v", f"{token_file}:/run/agent-token:ro,z",
         image,
         "python", "/app/agent_harness.py", "--agent", role,
@@ -1062,10 +1092,11 @@ def main():
 
         # Both containers are created before either heartbeat is awaited, so
         # agent-a does not get a head start proportional to agent-b's startup.
+        agent_src = stage_agent_src(match_dir)
         start_agent(cont_a, pod_name, image, "agent-a", "agent-b",
-                    token_file_a, args.model_a, HB_PORT_A, HB_PORT_B, args, mode)
+                    token_file_a, args.model_a, HB_PORT_A, HB_PORT_B, args, mode, agent_src)
         start_agent(cont_b, pod_name, image, "agent-b", "agent-a",
-                    token_file_b, args.model_b, HB_PORT_B, HB_PORT_A, args, mode)
+                    token_file_b, args.model_b, HB_PORT_B, HB_PORT_A, args, mode, agent_src)
         resources["containers"] += [cont_a, cont_b]
         # podman captures container stdout on the host, so this is a live view
         # of the same bytes collect_logs() harvests at teardown - and one the
@@ -1185,24 +1216,26 @@ def main():
         # token was used far more often than the agent itself acted, someone
         # else spent its budget or its time bank - so the match is not a
         # contest, whatever the scoreboard says.
-        abuse = None
+        # Self-sabotage is a LOSS, not a void. Marking it unrated used to hand a
+        # losing agent exactly the denial it was reaching for: burn your own
+        # budget, force exit 3, and the match does not count.
         for role, cont in (("agent-a", cont_a), ("agent-b", cont_b)):
             served = (final.get("requests") or {}).get(role)
             own_turns = ((last_state or {}).get(cont) or {}).get("steps")
             if served is None or own_turns is None:
                 continue
-            if served > own_turns * 4 + 10:
-                abuse = (f"{role} was served {served} model requests but took only "
-                         f"{own_turns} turns; its credential may have been used by "
-                         f"the opponent")
+            if served > own_turns * ABUSE_FACTOR + ABUSE_SLACK:
+                outcome = "self_sabotage"
+                winner = cont_b if role == "agent-a" else cont_a
+                reason = (f"{role} spent its own credential on {served} model "
+                          f"requests while taking only {own_turns} turns")
+                print(f"[verdict] {reason} — scored as a loss", flush=True)
                 break
 
         if rated:
             # The arena gate may already have marked this unrated; only decide
             # here if it did not.
             rated, unrated_reason = rating_decision(outcome, exit_codes, engagement)
-        if abuse:
-            rated, unrated_reason = False, abuse
 
         if outcome == "kill":
             loser_role = "agent-b" if winner == cont_a else "agent-a"

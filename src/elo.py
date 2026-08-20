@@ -143,6 +143,86 @@ def bootstrap_interval(results, k, samples=BOOTSTRAP_SAMPLES, seed=0):
     return intervals
 
 
+def ranked_order(ratings, games, min_games):
+    """Models eligible to be RANKED, best first.
+
+    The gate is on display and ordering only. Matches played by an unranked
+    model still update its opponents' ratings - discarding those games would
+    distort every ranked model's number."""
+    eligible = [(m, r) for m, r in ratings.items() if games.get(m, 0) >= min_games]
+    return [m for m, _ in sorted(eligible, key=lambda kv: -kv[1])]
+
+
+def spearman(rank_a, rank_b):
+    """Rank correlation between two orderings of the same models.
+
+    The single number that answers the project's actual question: does the time
+    regime change the answer? 1.0 means the boards agree completely, 0 means
+    they are unrelated, negative means they invert."""
+    shared = sorted(set(rank_a) & set(rank_b))
+    n = len(shared)
+    if n < 2:
+        return None
+    a = {m: i for i, m in enumerate(rank_a) if m in set(shared)}
+    b = {m: i for i, m in enumerate(rank_b) if m in set(shared)}
+    # Re-rank within the intersection so a model present in only one pool
+    # cannot shift everyone else's number and manufacture a correlation.
+    ra = {m: i for i, m in enumerate(sorted(shared, key=lambda m: a[m]))}
+    rb = {m: i for i, m in enumerate(sorted(shared, key=lambda m: b[m]))}
+    d2 = sum((ra[m] - rb[m]) ** 2 for m in shared)
+    return round(1 - (6 * d2) / (n * (n * n - 1)), 3)
+
+
+def compare_pools(pools, names, k, min_games):
+    """Cross-mode rank comparison.
+
+    Ratings are NOT comparable across pools - each is anchored independently -
+    so this compares RANKS, and only over models ranked in every pool named."""
+    orders = {}
+    for name in names:
+        if name not in pools:
+            print(f"No rated matches in mode {name!r}")
+            return
+        ratings, games = rate(pools[name], k)
+        orders[name] = ranked_order(ratings, games, min_games)
+
+    shared = set(orders[names[0]])
+    for name in names[1:]:
+        shared &= set(orders[name])
+    if not shared:
+        print("No model is ranked in every mode named, so ranks are not comparable.")
+        return
+
+    width = max(len(m) for m in shared) + 2
+    header = f"{'MODEL':<{width}}" + "".join(f"{n:>13}" for n in names)
+    if len(names) == 2:
+        header += f"{'D-rank':>8}"
+    print(header)
+    print("-" * len(header))
+
+    within = {n: [m for m in orders[n] if m in shared] for n in names}
+    for model in sorted(shared, key=lambda m: within[names[0]].index(m)):
+        row = f"{model:<{width}}"
+        positions = []
+        for name in names:
+            pos = within[name].index(m := model) + 1
+            positions.append(pos)
+            row += f"{('#' + str(pos)):>13}"
+        if len(names) == 2:
+            delta = positions[1] - positions[0]
+            row += f"{delta:>+8}"
+        print(row)
+
+    if len(names) == 2:
+        rho = spearman(within[names[0]], within[names[1]])
+        if rho is not None:
+            print(f"\nSpearman rank correlation ({names[0]} vs {names[1]}): "
+                  f"{rho} over {len(shared)} models")
+            if rho < 0.5:
+                print("The two regimes disagree substantially: the time rule is "
+                      "changing who wins, which is what these modes exist to expose.")
+
+
 def usage_per_model(results):
     """Mean total tokens per match, reported beside ELO but never scored."""
     totals, counts = {}, {}
@@ -172,6 +252,9 @@ def main():
                         help="rate results written before modes existed, in a 'legacy' pool")
     parser.add_argument("--mode", default=None,
                         help="show only this mode's leaderboard")
+    parser.add_argument("--compare", default=None,
+                        help="compare RANKS across two or more modes, "
+                             "e.g. --compare untimed,realtime")
     parser.add_argument("--quiet", action="store_true",
                         help="do not list skipped matches")
     args = parser.parse_args()
@@ -193,6 +276,10 @@ def main():
         return 0
 
     pools = partition(results)
+    if args.compare:
+        names = [n.strip() for n in args.compare.split(",") if n.strip()]
+        compare_pools(pools, names, args.k, args.min_games)
+        return 0
     if args.mode:
         pools = {k: v for k, v in pools.items() if k == args.mode}
         if not pools:
@@ -206,18 +293,28 @@ def main():
         usage = usage_per_model(pool)
 
         print(f"\n=== {pool_name} ({len(pool)} rated matches, K={args.k}) ===")
-        print(f"{'MODEL':<40} {'ELO':>7} {'95% CI':>17} {'GAMES':>6} {'TOK/MATCH':>10}")
-        print("-" * 84)
-        for model, rating in sorted(ratings.items(), key=lambda kv: -kv[1]):
+        print(f"{'RANK':>4}  {'MODEL':<38} {'ELO':>7} {'95% CI':>17} {'GAMES':>6} {'TOK/MATCH':>10}")
+        print("-" * 90)
+
+        def row(model, rank_label):
             lo, hi = intervals.get(model, (float("nan"), float("nan")))
             ci = f"{lo:.0f} - {hi:.0f}" if lo == lo else "n/a"
-            flag = "  *" if games[model] < args.min_games else ""
             tokens = usage.get(model)
             tok = f"{tokens:,.0f}" if tokens else "-"
-            print(f"{model:<40} {rating:>7.0f} {ci:>17} {games[model]:>6} {tok:>10}{flag}")
-        if any(games[m] < args.min_games for m in ratings):
-            print(f"* provisional: fewer than {args.min_games} games; the interval "
-                  f"spans most of the table, so ordering here is not meaningful.")
+            print(f"{rank_label:>4}  {model:<38} {ratings[model]:>7.0f} {ci:>17} "
+                  f"{games[model]:>6} {tok:>10}")
+
+        ranked = ranked_order(ratings, games, args.min_games)
+        for position, model in enumerate(ranked, 1):
+            row(model, str(position))
+
+        unranked = sorted((m for m in ratings if m not in set(ranked)),
+                          key=lambda m: -ratings[m])
+        if unranked:
+            print(f"UNRANKED (fewer than {args.min_games} games; rating shown, "
+                  f"not ordered - their matches still count toward ranked models)")
+            for model in unranked:
+                row(model, "-")
 
     if len(pools) > 1:
         print("\nModes are rated separately and are NOT comparable: each imposes "

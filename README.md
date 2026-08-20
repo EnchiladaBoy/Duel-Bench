@@ -118,9 +118,36 @@ listed on stdout with a reason, never dropped silently.
   stopped for a non-game reason (request budget spent, proxy unreachable) or
   when an agent never executed a single command
 
-Ratings are shown with a bootstrap 95% interval and marked provisional below
-`--min-games`. With a handful of matches that interval spans most of the table,
-which is the honest reading rather than a defect.
+Ratings carry a bootstrap 95% interval. Models below `--min-games` are listed but
+explicitly **UNRANKED** — their rating is shown, not ordered — because a rating from two
+games is not a standing. Their matches still count toward their opponents' ratings;
+dropping those games would distort every ranked model's number.
+
+A model that answers but issues no command **passes**: the turn is spent and play
+continues. Passing is a legal defensive move, so it must not make an agent inert. A model
+that never produces a usable tool call at all is different — after three repair attempts
+it **forfeits the match** (exit code 4), which is a rated loss rather than a discarded
+no-contest.
+
+### Comparing modes
+
+Ratings are anchored independently per mode and are **not** comparable across them.
+Ranks are — over the models ranked in every mode named:
+
+```
+$ python3 src/elo.py --compare untimed,realtime
+
+MODEL             untimed     realtime  D-rank
+----------------------------------------------
+slow/big               #1           #4      +3
+fast/small             #4           #1      -3
+
+Spearman rank correlation (untimed vs realtime): -1.0 over 4 models
+```
+
+That single number answers the question the whole project exists to ask: **does the time
+regime change who wins?** A model present in only one pool is excluded from the
+comparison rather than shifting everyone else's rank.
 
 ## Game modes
 
@@ -308,7 +335,7 @@ What it does **not** enforce, stated plainly:
 python3 -m unittest discover -s tests -v
 ```
 
-143 tests covering the scoring rules, the mode table, the lockstep barrier, the time
+153 tests covering the scoring rules, the mode table, the lockstep barrier, the time
 bank, request validation, credential disclosure, the event stream, and the command
 runner. No dependencies, no containers needed.
 

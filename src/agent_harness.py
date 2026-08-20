@@ -32,12 +32,14 @@ STATE = {
     "model_errors": 0,
     "stop_reason": None,
     "commands_run": 0,
+    "passes": 0,
     "arena": None,
 }
 
 # Exit codes the orchestrator interprets (see orchestrator.classify_exit).
 EXIT_OK = 0
-EXIT_INFRASTRUCTURE = 3
+EXIT_INFRASTRUCTURE = 3      # stopped for a non-game reason -> match is unrated
+EXIT_PROTOCOL_FORFEIT = 4    # never produced a usable command -> a real loss
 LOG_LOCK = threading.Lock()
 
 AGENT_ROLE = os.environ.get("AGENT_ROLE", "agent-a")
@@ -145,6 +147,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     "mode": STATE["mode"],
                     "stop_reason": STATE["stop_reason"],
                     "commands_run": STATE["commands_run"],
+                    "passes": STATE["passes"],
                     "uptime_seconds": round(time.time() - STARTED_AT, 2),
                 }
             ).encode("utf-8")
@@ -412,6 +415,34 @@ def barrier_wait(round_no):
         return json.loads(response.read().decode("utf-8"))
 
 
+def commit_at_barrier(step, passing=False):
+    """Commit this turn at the lockstep barrier and wait for the round.
+
+    Returns True if the move was forfeited for exceeding the move deadline.
+
+    A PASSED turn commits too. If it did not, an agent that declines to act
+    would leave its opponent blocked until the round deadline expired - the
+    fast model would be punished for the passive one's silence."""
+    if not LOCKSTEP:
+        return False
+    try:
+        join_info = barrier_join()
+        forfeited = bool(join_info.get("forfeit"))
+        release = barrier_wait(join_info.get("round", 0))
+        log("barrier", {
+            "step": step,
+            "round": release.get("round"),
+            "both_joined": release.get("both"),
+            "joined": release.get("joined"),
+            "forfeit": forfeited,
+            "passed": passing,
+        })
+        return forfeited
+    except Exception as exc:
+        log("barrier_error", {"step": step, "error": f"{type(exc).__name__}: {exc}"})
+        return False
+
+
 def build_system_prompt():
     opponent_heartbeat = ""
     if OPPONENT_HEARTBEAT_PORT:
@@ -446,7 +477,7 @@ Rules:
 {lockstep_note}"""
 
 
-def idle(reason, fatal=False):
+def idle(reason, fatal=False, code=None):
     """Stop acting.
 
     `fatal` means the agent stopped for a reason that is not a game outcome
@@ -467,7 +498,7 @@ def idle(reason, fatal=False):
     if fatal:
         sys.stderr.write(f"agent-deathmatch: stopping, {reason}\n")
         sys.stderr.flush()
-        sys.exit(EXIT_INFRASTRUCTURE)
+        sys.exit(EXIT_INFRASTRUCTURE if code is None else code)
     while True:
         time.sleep(3600)
 
@@ -580,25 +611,29 @@ def main():
                 }
             )
             if no_command_count >= MAX_NO_COMMAND:
-                idle("model_protocol_error", fatal=True)
+                idle("model_protocol_error", fatal=True, code=EXIT_PROTOCOL_FORFEIT)
             messages = trim_messages(messages)
             continue
 
         if action["kind"] == "none":
-            no_command_count += 1
+            # The model answered but declined to act. Passing is a legal
+            # defensive move and it already costs a turn - and in time-bank, the
+            # seconds spent thinking about it. It must not make the agent
+            # permanently inert, which would let a passive model drag every
+            # match to a timeout draw while never really being in play.
+            STATE["passes"] += 1
+            commit_at_barrier(step, passing=True)
+            log("pass", {"step": step, "content": action.get("content"),
+                         "passes": STATE["passes"]})
             if action.get("message"):
                 messages.append(normalize_assistant_message(action["message"]))
             messages.append(
                 {
                     "role": "user",
-                    "content": "You must issue exactly one run_bash command now.",
+                    "content": ("You passed that turn - no command was issued, and the "
+                                "turn is spent. Issue exactly one run_bash command now."),
                 }
             )
-            if no_command_count >= MAX_NO_COMMAND:
-                # The model responded, it just declined to act. That is a
-                # forfeit of initiative, not a broken pipeline, so the agent
-                # stays up and the match is still ratable.
-                idle("no_command")
             messages = trim_messages(messages)
             continue
 
@@ -613,30 +648,7 @@ def main():
         command = action["command"]
         STATE["last_command"] = command
 
-        forfeited = False
-        if LOCKSTEP:
-            # Commit this move at the barrier, then wait until the opponent has
-            # also committed (or the round deadline passes) so both commands
-            # start together regardless of model latency.
-            try:
-                join_info = barrier_join()
-                forfeited = bool(join_info.get("forfeit"))
-                release = barrier_wait(join_info.get("round", 0))
-                log(
-                    "barrier",
-                    {
-                        "step": step,
-                        "round": release.get("round"),
-                        "both_joined": release.get("both"),
-                        "joined": release.get("joined"),
-                        "forfeit": forfeited,
-                    },
-                )
-            except Exception as exc:
-                log(
-                    "barrier_error",
-                    {"step": step, "error": f"{type(exc).__name__}: {exc}"},
-                )
+        forfeited = commit_at_barrier(step)
 
         if forfeited:
             # Too slow for this mode's deadline: the round is lost, the command

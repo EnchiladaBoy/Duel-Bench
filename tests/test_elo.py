@@ -187,3 +187,77 @@ class TestModePartitioning(unittest.TestCase):
         usage = elo.usage_per_model(elo.load_results(self.root)[0])
         self.assertEqual(usage["a/one"], 400)
         self.assertEqual(usage["b/two"], 200)
+
+
+class TestRankingGate(unittest.TestCase):
+    """--min-games gates DISPLAY and ORDERING, never the rating update."""
+
+    def test_only_models_over_the_threshold_are_ranked(self):
+        ratings = {"a": 1600, "b": 1500, "c": 1400}
+        games = {"a": 10, "b": 2, "c": 10}
+        self.assertEqual(elo.ranked_order(ratings, games, 5), ["a", "c"])
+
+    def test_ranked_order_is_best_first(self):
+        ratings = {"a": 1400, "b": 1600}
+        games = {"a": 9, "b": 9}
+        self.assertEqual(elo.ranked_order(ratings, games, 5), ["b", "a"])
+
+    def test_an_unranked_model_still_moves_its_opponents_rating(self):
+        # Dropping those games would distort every ranked model's number.
+        results = [{"model_a": "veteran", "model_b": "newcomer", "winner": "agent-a"}]
+        ratings, games = elo.rate(results, k=32.0)
+        self.assertGreater(ratings["veteran"], 1500)
+        self.assertEqual(elo.ranked_order(ratings, games, min_games=5), [])
+
+    def test_nobody_qualifies_yields_an_empty_ranking_not_a_crash(self):
+        self.assertEqual(elo.ranked_order({"a": 1500}, {"a": 1}, 5), [])
+
+
+class TestSpearman(unittest.TestCase):
+    """The single number answering 'does the time regime change the answer?'"""
+
+    def test_identical_orderings_correlate_perfectly(self):
+        order = ["a", "b", "c", "d"]
+        self.assertEqual(elo.spearman(order, order), 1.0)
+
+    def test_exact_inversion_is_minus_one(self):
+        self.assertEqual(elo.spearman(["a", "b", "c", "d"], ["d", "c", "b", "a"]), -1.0)
+
+    def test_too_few_models_is_undefined_not_wrong(self):
+        self.assertIsNone(elo.spearman(["a"], ["a"]))
+        self.assertIsNone(elo.spearman([], []))
+
+    def test_only_the_intersection_is_compared(self):
+        # A model ranked in one pool and absent from the other would otherwise
+        # shift everyone else's number and manufacture a correlation.
+        self.assertEqual(
+            elo.spearman(["a", "b", "c"], ["ghost", "a", "b", "c"]), 1.0)
+
+    def test_partial_disagreement_lands_between(self):
+        rho = elo.spearman(["a", "b", "c", "d"], ["a", "c", "b", "d"])
+        self.assertLess(rho, 1.0)
+        self.assertGreater(rho, 0.0)
+
+
+class TestCrossModeInversion(unittest.TestCase):
+    """The project's thesis: the time regime can invert the ranking."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_the_same_pair_can_rank_opposite_ways_in_two_modes(self):
+        for i in range(6):
+            write_match(self.root, f"u{i}", mode="untimed",
+                        model_a="slow/big", model_b="fast/small", winner="agent-a")
+            write_match(self.root, f"r{i}", mode="realtime",
+                        model_a="slow/big", model_b="fast/small", winner="agent-b")
+        pools = elo.partition(elo.load_results(self.root)[0])
+        untimed = elo.ranked_order(*elo.rate(pools["untimed"], 32.0), min_games=5)
+        realtime = elo.ranked_order(*elo.rate(pools["realtime"], 32.0), min_games=5)
+        self.assertEqual(untimed[0], "slow/big")
+        self.assertEqual(realtime[0], "fast/small")
+        self.assertEqual(elo.spearman(untimed, realtime), -1.0)

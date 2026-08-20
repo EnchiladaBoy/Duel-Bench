@@ -74,7 +74,7 @@ DRAWN_OUTCOMES = frozenset({"double_kill", "rounds_complete", "banks_exhausted",
 # alive and killable". When BOTH agents report one, the match is over: waiting
 # for the runaway guard would just produce a slow, semantically mushy draw.
 STOPPED_REASONS = frozenset({
-    "max_steps_reached", "rounds_complete", "time_bank_exhausted", "no_command",
+    "max_steps_reached", "rounds_complete", "time_bank_exhausted",
 })
 # Which drawn outcome a mutual stop corresponds to, by termination rule.
 STOP_OUTCOME = {"rounds": "rounds_complete", "banks": "banks_exhausted",
@@ -1092,6 +1092,11 @@ def main():
             rated, unrated_reason = rating_decision(outcome, exit_codes, engagement)
         if abuse:
             rated, unrated_reason = False, abuse
+
+        if outcome == "kill":
+            loser_role = "agent-b" if winner == cont_a else "agent-a"
+            if classify_exit(exit_codes.get(loser_role)) == "forfeit":
+                outcome = "protocol_forfeit"
 
         winner_role = {cont_a: "agent-a", cont_b: "agent-b"}.get(winner, winner)
         usage, inference = summarize_proxy_log(match_dir)

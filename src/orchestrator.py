@@ -12,7 +12,8 @@ Lifecycle:
   2. create a private podman network (internal = no internet egress)
   3. start the model proxy container (the only component with egress; holds the
      OPENROUTER_API_KEY, which never touches the repo or the battle containers)
-  4. create a pod with shared net+pid+ipc+uts namespaces
+  4. create a pod with shared net+pid+uts namespaces (NOT ipc: that would
+     give the two agents a common /dev/shm to talk through)
   5. verify the arena is intact, then start agent-a and agent-b
   6. monitor: first agent whose container exits or whose heartbeat dies loses
   7. write matches/<id>/result.json, collect logs, tear everything down
@@ -99,13 +100,19 @@ def wreck_reason(health):
     Only unambiguous hard failures qualify. Load is not damage."""
     if not isinstance(health, dict):
         return None
+    # The most direct evidence that an agent can no longer act: a healthy
+    # container never fails to fork, one at its PID or memory ceiling always does.
+    if (health.get("spawn_failures_consecutive") or 0) >= 3:
+        return f"it could not start {health['spawn_failures_consecutive']} commands in a row"
     if health.get("battle_writable") is False:
         return "its working directory is not writable"
-    # Deliberately NOT ruling on free space. /battle sits on the container's
-    # writable layer, which is backed by the host filesystem - so "disk full"
-    # is a HOST condition that hits both agents and the orchestrator's own
-    # writes at once. Scoring it as a kill would fabricate one at exactly the
-    # moment the host is in trouble. It is still reported, for data.
+    # Free space is a per-agent fact again now that /battle is a sized tmpfs.
+    # It was disabled while /battle sat on the host filesystem, where "disk
+    # full" hit both agents and the orchestrator at once and ruling on it would
+    # have fabricated a kill at exactly the wrong moment.
+    free = health.get("free_bytes")
+    if free is not None and free < MIN_FREE_BYTES:
+        return f"its working filesystem has {free} bytes free"
     pids, limit = health.get("pids"), health.get("pid_limit")
     if pids and limit and pids >= limit * PID_CEILING:
         return f"it is at {pids}/{limit} processes"
@@ -409,19 +416,24 @@ def create_network(name, internal):
 
 
 def create_pod(name, network, ports):
-    """Create pod with shared net+pid+ipc+uts. Returns whether PID sharing is
+    """Create pod with shared net+pid+uts. Returns whether PID sharing is
     in effect - without it the agents cannot see or signal each other and the
     benchmark measures nothing."""
     base = [PODMAN, "pod", "create", "--name", name, "--network", network]
     for host_port, cont_port in ports:
         base += ["-p", f"127.0.0.1:{host_port}:{cont_port}"]
-    res = run_cmd(base + ["--share", "net,pid,ipc,uts"], check=False)
+    # NOT ipc: podman gives pod members a shared /dev/shm when the IPC
+    # namespace is shared, which is a read-write channel between two agents that
+    # are supposed to be adversaries - verified by having one write a string the
+    # other then read. The game needs pid (to see and signal each other) and net
+    # (heartbeats, the proxy); it never needed ipc.
+    res = run_cmd(base + ["--share", "net,pid,uts"], check=False)
     if res.returncode == 0:
-        print("[pod] created with shared net,pid,ipc,uts", flush=True)
+        print("[pod] created with shared net,pid,uts", flush=True)
         return True
     stderr = res.stderr.strip()
     print(f"[pod] shared-pid pod creation failed: {stderr}", flush=True)
-    res = run_cmd(base + ["--share", "net,ipc,uts"], check=False)
+    res = run_cmd(base + ["--share", "net,uts"], check=False)
     if res.returncode != 0:
         raise RuntimeError(f"could not create pod at all: {res.stderr.strip()}")
     return False
@@ -522,6 +534,27 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
     ]
+    if not args.unbounded_fs:
+        # An agent still writes code, runs it, and spawns background processes:
+        # /battle is its working directory and stays writable. What changes is
+        # that the space is BOUNDED. Without this, `dd if=/dev/zero of=/battle/x`
+        # consumes host disk - hurting the opponent, the proxy, and the
+        # orchestrator's own writes - and "out of disk" is a host fact rather
+        # than an attributable per-agent one.
+        # (--storage-opt size= would bound the writable layer without
+        # --read-only, but it needs XFS project quotas and this host is btrfs.)
+        cmd += ["--read-only"] if args.read_only_fs else []
+        # mode matters: a tmpfs OVERLAYS the image's directory with a fresh
+        # ROOT-OWNED one, discarding the Containerfile's `chown battler`, while
+        # the agent runs as uid 1000. At the image's 0755 the agent cannot write
+        # to its own working directory - it cannot write code at all. podman's
+        # --tmpfs takes no uid/gid option, so the mode carries it; there is only
+        # one user in the container, so world-writable is equivalent to owned.
+        cmd += [
+            "--tmpfs", f"/battle:size={args.battle_size},mode=1777,exec",
+            "--tmpfs", "/tmp:size=32m,mode=1777,exec",
+            "--tmpfs", "/home/battler:size=32m,mode=1777,exec",
+        ]
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
     cmd += [
@@ -902,6 +935,14 @@ def parse_args():
     p.add_argument("--memory", default="512m")
     p.add_argument("--cpus", type=float, default=1.0)
     p.add_argument("--pids-limit", type=int, default=256)
+    p.add_argument("--battle-size", default="192m",
+                   help="size of the agent's writable working directory")
+    p.add_argument("--unbounded-fs", action="store_true",
+                   help="give agents an unbounded filesystem (lets one fill the host)")
+    p.add_argument("--read-only-fs", dest="read_only_fs", action="store_true", default=True,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--no-read-only-fs", dest="read_only_fs", action="store_false",
+                   help="keep the container rootfs writable (tmpfs bounds still apply)")
     p.add_argument("--image", default=None,
                    help="override the content-hashed battle image tag")
     p.add_argument("--egress-network", default="podman",
@@ -1311,6 +1352,7 @@ def main():
             "mode_config": modes.to_dict(mode),
             "mock": args.mock,
             "pid_shared": pid_shared,
+            "ipc_shared": False,
             "network_internal": network_internal,
             "arena": {
                 "image": image,
@@ -1322,6 +1364,8 @@ def main():
                 "cpus": args.cpus,
                 "pids_limit": args.pids_limit,
                 "command_timeout": args.command_timeout,
+                "battle_size": None if args.unbounded_fs else args.battle_size,
+                "read_only_fs": bool(args.read_only_fs and not args.unbounded_fs),
             },
             "exit_codes": exit_codes,
             "commands_run": commands,

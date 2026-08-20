@@ -275,12 +275,33 @@ class TestWreckDetection(unittest.TestCase):
     def test_an_unwritable_working_directory_is_wrecked(self):
         self.assertIn("not writable", orch.wreck_reason({"battle_writable": False}))
 
-    def test_a_full_filesystem_is_NOT_ruled_on(self):
-        """/battle sits on the container's writable layer, backed by the host
-        filesystem - so "disk full" is a HOST condition hitting both agents and
-        the orchestrator's own writes at once. Ruling on it would fabricate a
-        kill at exactly the moment the host is in trouble."""
-        self.assertIsNone(orch.wreck_reason({"battle_writable": True, "free_bytes": 1024}))
+    def test_a_full_filesystem_IS_ruled_on_now_it_is_bounded(self):
+        """Re-enabled deliberately. While /battle sat on the host filesystem,
+        "disk full" was a HOST condition hitting both agents and the
+        orchestrator at once, and ruling on it would have fabricated a kill at
+        the worst possible moment. Now that /battle is a sized tmpfs, running
+        out is a per-agent fact and it is self-inflicted."""
+        reason = orch.wreck_reason({"battle_writable": True, "free_bytes": 1024})
+        self.assertIn("bytes free", reason)
+
+    def test_a_spawn_failure_streak_is_the_primary_signal(self):
+        # A healthy container never fails to fork; one at its PID or memory
+        # ceiling always does. This is "cannot act", observed rather than inferred.
+        reason = orch.wreck_reason({"battle_writable": True, "free_bytes": 5 << 30,
+                                    "spawn_failures_consecutive": 3})
+        self.assertIn("could not start", reason)
+
+    def test_one_spawn_failure_is_not_a_verdict(self):
+        self.assertIsNone(orch.wreck_reason({"battle_writable": True,
+                                             "free_bytes": 5 << 30,
+                                             "spawn_failures_consecutive": 1}))
+
+    def test_spawn_failures_that_recovered_are_not_a_verdict(self):
+        # The consecutive counter resets on the next successful fork.
+        self.assertIsNone(orch.wreck_reason({"battle_writable": True,
+                                             "free_bytes": 5 << 30,
+                                             "spawn_failures": 9,
+                                             "spawn_failures_consecutive": 0}))
 
     def test_hitting_the_process_ceiling_is_wrecked(self):
         reason = orch.wreck_reason({"battle_writable": True, "free_bytes": 5 << 30,

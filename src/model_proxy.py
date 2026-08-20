@@ -760,9 +760,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 refusal, remaining = "time_bank_exhausted", None
             elif token in IN_FLIGHT:
                 refusal, remaining = "concurrent_request", None
-            elif REQUEST_COUNT[token] >= MAX_REQUESTS or (
-                    MAX_TOKENS_BUDGET and TOKEN_USAGE[token] >= MAX_TOKENS_BUDGET):
-                refusal, remaining = "proxy_budget", None
+            elif REQUEST_COUNT[token] >= MAX_REQUESTS:
+                # With max_requests > max_steps * MAX_MODEL_RETRIES enforced in
+                # the mode table, a correct harness CANNOT reach this - so it is
+                # evidence of an out-of-band caller rather than a heuristic.
+                refusal, remaining = "request_budget", None
+            elif MAX_TOKENS_BUDGET and TOKEN_USAGE[token] >= MAX_TOKENS_BUDGET:
+                # A spend allowance applied equally to both agents, reachable by
+                # a perfectly-behaved verbose model. A game resource, like a
+                # time bank - not a fault.
+                refusal, remaining = "token_budget", None
             else:
                 REQUEST_COUNT[token] += 1
                 IN_FLIGHT[token] = time.monotonic()
@@ -779,11 +786,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             send_json(self, 429, {"error": "one move in flight at a time",
                                   "error_kind": "concurrent_request"})
             return
-        if refusal == "proxy_budget":
-            log({"event": "budget_exhausted", "agent": role_of(token),
+        if refusal in ("request_budget", "token_budget"):
+            log({"event": "budget_exhausted", "kind": refusal, "agent": role_of(token),
                  "requests": REQUEST_COUNT[token], "tokens": TOKEN_USAGE[token]})
-            send_json(self, 429, {"error": "request budget exhausted",
-                                  "error_kind": "proxy_budget"})
+            send_json(self, 429, {"error": f"{refusal.replace('_', ' ')} exhausted",
+                                  "error_kind": refusal})
             return
 
         # Clamp the call so an agent with two seconds left cannot burn a full

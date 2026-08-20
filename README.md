@@ -16,7 +16,7 @@ host
 ├── podman network (internal, no internet egress for agents)
 │   ├── proxy container      model_proxy.py — the ONLY component with egress
 │   │                        (holds OPENROUTER_API_KEY; agents never see it)
-│   └── pod (shared net/pid/ipc/uts namespaces)
+│   └── pod (shared net/pid/uts namespaces — not ipc)
 │       ├── agent-a          agent_harness.py + bash, curl, nmap, pkill, ...
 │       └── agent-b          agent_harness.py + bash, curl, nmap, pkill, ...
 ```

@@ -271,7 +271,10 @@ class TestHTTPSurface(unittest.TestCase):
         status, body = self._request(
             "/v1/chat/completions", b'{"messages":[]}', token=TOK_B, method="POST")
         self.assertEqual(status, 429)
-        self.assertEqual(body.get("error_kind"), "proxy_budget")
+        # Split from the token budget: with max_requests > max_steps * retries
+        # enforced in the mode table, a correct harness cannot reach this one,
+        # so it is evidence of an out-of-band caller rather than a heuristic.
+        self.assertEqual(body.get("error_kind"), "request_budget")
 
 
 if __name__ == "__main__":
@@ -320,3 +323,20 @@ class TestStartingGun(unittest.TestCase):
             mp.STARTING_GUN_TIMEOUT = original
         self.assertGreater(elapsed, 0.3)
         self.assertLess(elapsed, 3.0)
+
+
+class TestBudgetsAreDistinct(unittest.TestCase):
+    """A spend allowance a verbose model can legitimately reach is a game
+    resource, like a time bank. A request budget a correct harness cannot reach
+    is evidence. Collapsing them lost that distinction."""
+
+    def test_the_two_kinds_are_not_the_same_string(self):
+        source = Path(mp.__file__).read_text()
+        self.assertIn('"request_budget"', source)
+        self.assertIn('"token_budget"', source)
+
+    def test_the_harness_treats_both_as_end_of_play_not_failure(self):
+        harness = (Path(mp.__file__).parent / "agent_harness.py").read_text()
+        self.assertIn('kind in ("request_budget", "token_budget"', harness)
+        # Non-fatal: reaching a limit by playing must not void the match.
+        self.assertIn('idle("budget_exhausted")', harness)

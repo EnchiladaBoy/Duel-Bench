@@ -34,13 +34,15 @@ class TestResolution(unittest.TestCase):
 
 
 class TestPromptNote(unittest.TestCase):
-    def test_warfare_note_mentions_shared_ip_not_localhost(self):
+    def test_warfare_note_prefers_network_attacks(self):
         note = warfare.prompt_note(warfare.WARFARE_ON)
         self.assertIn("hostname -I", note)
-        self.assertIn("NOT on localhost", note)
+        self.assertIn("ps aux", note)
+        self.assertIn("net+uts only", note)
 
     def test_classic_prompt_note_is_empty(self):
         self.assertEqual(warfare.prompt_note(warfare.CLASSIC), "")
+
 
     def test_to_dict_is_plain(self):
         self.assertEqual(warfare.to_dict(warfare.WARFARE_ON),

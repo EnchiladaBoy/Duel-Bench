@@ -416,10 +416,14 @@ def create_network(name, internal):
     return False
 
 
-def create_pod(name, network, ports):
-    """Create pod with shared net+pid+uts. Returns whether PID sharing is
+def create_pod(name, network, ports, classic=False):
+    """Create pod with shared net[+pid]+uts. Returns whether PID sharing is
     in effect - without it the agents cannot see or signal each other and the
-    benchmark measures nothing."""
+    benchmark now deliberately ships no-PID visibility (no ps/pkill across
+    containers).
+
+    --classic still asks for net,pid,uts because its scoring credited those
+    kills - the old arena topology stays reproducible."""
     base = [PODMAN, "pod", "create", "--name", name, "--network", network]
     for host_port, cont_port in ports:
         base += ["-p", f"127.0.0.1:{host_port}:{cont_port}"]
@@ -428,10 +432,11 @@ def create_pod(name, network, ports):
     # are supposed to be adversaries - verified by having one write a string the
     # other then read. The game needs pid (to see and signal each other) and net
     # (heartbeats, the proxy); it never needed ipc.
-    res = run_cmd(base + ["--share", "net,pid,uts"], check=False)
+    share = "net,pid,uts" if classic else "net,uts"
+    res = run_cmd(base + ["--share", share], check=False)
     if res.returncode == 0:
-        print("[pod] created with shared net,pid,uts", flush=True)
-        return True
+        print(f"[pod] created with shared {share}", flush=True)
+        return classic
     stderr = res.stderr.strip()
     print(f"[pod] shared-pid pod creation failed: {stderr}", flush=True)
     res = run_cmd(base + ["--share", "net,uts"], check=False)
@@ -517,6 +522,8 @@ def start_agent(name, pod, image, role, opponent, token_file, model,
         "PROXY_URL": f"http://{args.proxy_name_for_agents}:{PROXY_CONTAINER_PORT}/v1/chat/completions",
         "HEARTBEAT_PORT": str(hb_port),
         "OPPONENT_HEARTBEAT_PORT": str(opp_hb_port),
+        "TERRAIN_BASE_PORT": str(8088 if role == "agent-a" else 8089),
+        "OPPONENT_TERRAIN_BASE_PORT": str(8089 if role == "agent-a" else 8088),
         "COMMAND_TIMEOUT": str(args.command_timeout),
         "BATTLE_DIR": "/battle",
         # No host bind mount for logs in classic mode: stdout is collected on
@@ -607,12 +614,17 @@ def heartbeat_state(url, timeout):
 
 def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
             control_url, control_token, termination="wall_clock",
-            events=None, roles=None, wreck_observe_only=False):
+            events=None, roles=None, wreck_observe_only=False,
+            wreck_only=False):
     """Returns (winner, outcome, reason, duration, detail).
 
     Liveness for both agents is computed from ONE atomic snapshot before any
     verdict is reached, so the two win conditions cannot race each other and a
     simultaneous double kill is not decided by probe ordering.
+
+    In wreck_only (warfare) mode a container exit or a heartbeat silence is
+    arena_error rather than a win - the verdict only lands when it is a
+    self-reported environment wreck. Process-kill no longer rewards anyone.
     """
     start = time.time()
     deadline = start + time_limit
@@ -708,14 +720,25 @@ def monitor(containers, hb_urls, time_limit, poll_interval, grace_seconds,
                     round(now - start, 1), last_state)
         if len(down) == 1:
             loser = next(iter(down))
-            winner = [n for n in containers if n != loser][0]
             kind, info = down[loser]
+            if wreck_only and kind in ("exited", "heartbeat"):
+                # In warfare mode a process kill or a heartbeat silence is a
+                # match-ending non-verdict, not a win. If the agent did not
+                # actually self-wreck, the match is arena_error.
+                reason = (f"{loser} container exited (exit code {info})"
+                          if kind == "exited"
+                          else f"{loser} heartbeat silent for {info}s")
+                if events:
+                    events.emit("orchestrator", "agent_downed_unrated",
+                                agent=(roles or {}).get(loser, loser), how=kind, detail=info)
+                return "error", "arena_error", reason, round(now - start, 1), last_state
             if kind == "exited":
                 reason, outcome = f"{loser} exited (exit code {info})", "kill"
             elif kind == "wrecked":
                 reason, outcome = f"{loser} environment wrecked: {info}", "wrecked"
             else:
                 reason, outcome = f"{loser} heartbeat silent for {info}s", "kill"
+            winner = [n for n in containers if n != loser][0]
             return winner, outcome, reason, round(now - start, 1), last_state
 
         # The control poll above does double duty: proxy liveness probe AND the
@@ -1153,25 +1176,30 @@ def main():
         resources["network"] = net_name
 
         pid_shared = create_pod(
-            pod_name, net_name, [(host_port_a, HB_PORT_A), (host_port_b, HB_PORT_B)])
+            pod_name, net_name,
+            [(host_port_a, HB_PORT_A), (host_port_b, HB_PORT_B)],
+            classic=args.classic)
         resources["pod"] = pod_name
 
         # --- arena integrity gate -------------------------------------------
-        # Without a shared PID namespace the agents cannot see or signal each
-        # other, so nothing the benchmark claims to measure can happen. Without
-        # an internal network the isolation the README promises is absent.
-        # Refuse to play rather than produce a result that looks legitimate.
+        # Classic mode needs a shared PID namespace (its scoring counted those
+        # kills). Warfare mode is intentionally pid-less - the two agents have
+        # to reach each other over the shared network, and a container exit
+        # without an answering heartbeat becomes arena_error rather than a
+        # reward.
         degraded = []
-        if not pid_shared:
-            degraded.append("no shared PID namespace (agents cannot reach each other)")
+        if args.classic and not pid_shared:
+            degraded.append("no shared PID namespace (classic mode needs it)")
         if not network_internal:
             degraded.append("no internal network (agents have internet egress)")
         if degraded:
             # An explicit --no-internal-network is a deliberate choice, so the
             # match is allowed - but it is still recorded as unrated, because
-            # the leaderboard must not mix arenas.
+            # the leaderboard must not mix arenas. In warfare mode pid_shared
+            # is deliberately absent, so the second clause unblocks downgrades
+            # even without it.
             if not (args.allow_degraded or
-                    (args.no_internal_network and pid_shared)):
+                    (args.no_internal_network and (pid_shared or not args.classic))):
                 raise ArenaError(
                     "arena could not be built to spec: " + "; ".join(degraded)
                     + ". Refusing to play a match that cannot measure anything. "
@@ -1268,6 +1296,7 @@ def main():
             args.grace_seconds, control_url, control_token, mode.termination,
             events, {cont_a: "agent-a", cont_b: "agent-b"},
             args.wreck_observe_only,
+            wreck_only=warf.enabled,
         )
     except ArenaError as exc:
         winner, reason = "error", str(exc)
@@ -1322,6 +1351,19 @@ def main():
         states = inspect_containers([cont_a, cont_b]) if resources["containers"] else {}
         exit_codes = {r: (states.get(c, {}) or {}).get("exit_code")
                       for r, c in (("agent-a", cont_a), ("agent-b", cont_b))}
+
+        # Final terrain scores: pull the last /health payload per container
+        # before teardown, so result.json records how well each side defended.
+        terrain_score = {}
+        for role, cont in (("agent-a", cont_a), ("agent-b", cont_b)):
+            hb = (last_state or {}).get(cont) or {}
+            if isinstance(hb, dict):
+                tc = hb.get("terrain")
+                if isinstance(tc, dict):
+                    terrain_score[role] = {
+                        "score": tc.get("score", 0),
+                        "spoofs": tc.get("spoofs", 0),
+                    }
 
         # commands_run from the heartbeat can be up to one poll stale and misses
         # a dying agent's last moves; the collected log is complete. Take the max.
@@ -1416,6 +1458,7 @@ def main():
                 "read_only_fs": bool(args.read_only_fs and not args.unbounded_fs),
                 "wreck_observe_only": bool(args.wreck_observe_only),
                 "warfare": warfare.to_dict(warf),
+                "terrain": terrain_score,
             },
             "exit_codes": exit_codes,
             "commands_run": commands,

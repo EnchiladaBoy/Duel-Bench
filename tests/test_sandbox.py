@@ -15,12 +15,12 @@ SOURCE = (SRC / "orchestrator.py").read_text()
 
 
 class TestNamespaceSharing(unittest.TestCase):
-    """The agents must see and be able to signal each other - and nothing else."""
+    """Pod sharing must be deliberate for the mode: classic still ships
+    net,pid,uts because its scoring counted process-kill. Warfare ships
+    net,uts - the two agents must now reach each other over the network."""
 
-    def test_the_pid_namespace_is_shared(self):
-        # Without it neither agent can find or kill the other and the whole
-        # premise of the benchmark is void.
-        self.assertIn('"--share", "net,pid,uts"', SOURCE)
+    def test_classic_still_shares_pid(self):
+        self.assertIn('share = "net,pid,uts" if classic else "net,uts"', SOURCE)
 
     def test_the_ipc_namespace_is_NOT_shared(self):
         """Sharing IPC gives pod members a common /dev/shm - a read-write
@@ -29,9 +29,9 @@ class TestNamespaceSharing(unittest.TestCase):
         self.assertNotIn("net,pid,ipc,uts", SOURCE)
         self.assertNotIn("net,ipc,uts", SOURCE)
 
-    def test_the_degraded_fallback_also_drops_ipc(self):
-        # create_pod retries without pid when shared-pid pod creation fails; that
-        # path must not quietly restore the channel.
+    def test_degraded_fallback_keeps_ipc_closed(self):
+        # create_pod retries without pid when any other share fails; that path
+        # must not quietly restore the channel.
         self.assertIn('"--share", "net,uts"', SOURCE)
 
     def test_a_match_records_that_ipc_was_not_shared(self):

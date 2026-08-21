@@ -316,6 +316,9 @@ def start_terrain():
 MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(1 << 20)))
 
 
+SPOOF_WRECK_THRESHOLD = int(os.environ.get("SPOOF_WRECK_THRESHOLD", "64"))
+
+
 def environment_health():
     """Signals for the "environment wrecked" win condition.
 
@@ -326,11 +329,15 @@ def environment_health():
     PID usage comes from the container's own cgroup, NOT from counting /proc:
     the two agents share a PID namespace, so /proc shows the opponent's
     processes too and would report one agent's fork bomb against the other.
-    """
+
+    Terrain spoofs degrade the harness's ability to serve its heartbeat: a
+    heavy flood is evidence the opponent is actively attacking the arena, not
+    a load spike."""
     health = {"battle_writable": None, "free_bytes": None,
               "pids": None, "pid_limit": None,
               "spawn_failures": STATE["spawn_failures"],
-              "spawn_failures_consecutive": STATE["spawn_failures_consecutive"]}
+              "spawn_failures_consecutive": STATE["spawn_failures_consecutive"],
+              "terrain_spoofs": 0}
 
     probe = os.path.join(BATTLE_DIR, f".health-{os.getpid()}")
     try:
@@ -355,6 +362,14 @@ def environment_health():
             health["pid_limit"] = None if raw == "max" else int(raw)
     except (OSError, ValueError):
         pass
+
+    tc = _read_terrain_score()
+    health["terrain_spoofs"] = tc["spoofs"]
+    if tc["spoofs"] >= SPOOF_WRECK_THRESHOLD:
+        # Sustained terrain flooding degrades the harness's ability to serve
+        # its heartbeat and defend its ports - the environment is no longer
+        # reliably usable, which is what the wreck condition measures.
+        health["battle_writable"] = False
     return health
 
 

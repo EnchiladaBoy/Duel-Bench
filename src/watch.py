@@ -62,20 +62,37 @@ class MatchState:
         self.feed = []
         self.finished = None
         self.rated = None
+        self.attacks = []          # [(t, src, dst, kind)]
+        self.terrain = {}          # {role: {"score": int, "spoofs": int}}
+        self.steps = {}            # {role: [(step, command, cls)]}
 
     def agent(self, role):
         return self.agents.setdefault(role, {
             "alive": True, "steps": 0, "commands": 0, "passes": 0,
             "forfeits": 0, "bank": None, "thinking": None, "last": "",
-            "stop_reason": None,
+            "stop_reason": None, "health": None,
         })
 
-    def note(self, text):
+    def note(self, text, cls="recon"):
         # Carry the match time with the entry. Storing bare strings meant a
         # viewer that joined late - or replayed - showed every line at 0.0s,
         # because the timestamp only existed in the renderer's local variable.
-        self.feed.append((round(self.elapsed, 1), text))
+        self.feed.append((round(self.elapsed, 1), text, cls))
         del self.feed[:-200]
+
+    @staticmethod
+    def classify_command(command):
+        """Light heuristic for coloring the feed."""
+        c = command.lower()
+        if "kill" in c or "pkill" in c or "nc " in c or "sleep" in c or "flood" in c:
+            return "attack"
+        if "curl" in c and "POST" in c.upper():
+            return "attack"
+        if "curl" in c and ("/debug" in c or "/telemetry" in c):
+            return "defense"
+        if "respawn" in c or "while true" in c:
+            return "defense"
+        return "recon"
 
     # The harness prints its log to container stdout and the orchestrator
     # ingests every line, so an agent's shell can `echo` a record onto its own
@@ -134,14 +151,32 @@ class MatchState:
             agent["commands"] += 1
             agent["steps"] = event.get("step") or agent["steps"] + 1
             agent["last"] = (event.get("command") or "").strip()
+            cls = self.classify_command(agent["last"])
+            self.steps.setdefault(role, []).append(
+                (agent["steps"], agent["last"], cls))
+            del self.steps[role][-5:]
             self.note(f"{ROLE_COLOUR.get(role, '')}{role}{RESET} "
-                      f"{BOLD}${RESET} {agent['last']}")
+                      f"{BOLD}${RESET} {agent['last']}", cls)
         elif kind == "command_result" and role:
             code = event.get("exit_code")
             if event.get("timed_out"):
-                self.note(f"{GREY}    {role}: timed out{RESET}")
+                self.note(f"{GREY}    {role}: timed out{RESET}", "error")
             elif code not in (0, None):
-                self.note(f"{GREY}    {role}: exit {code}{RESET}")
+                self.note(f"{GREY}    {role}: exit {code}{RESET}", "error")
+        elif kind == "terrain_defended" and role:
+            self.terrain.setdefault(role, {"score": 0, "spoofs": 0})
+            self.terrain[role]["score"] = event.get("score", 0)
+            self.note(f"{ROLE_COLOUR.get(role, '')}{role}{RESET} "
+                      f"{BOLD}defends{RESET} (score {event.get('score')})", "defense")
+        elif kind in ("terrain_signal_hijacked", "terrain_telemetry_flooded") and role:
+            self.terrain.setdefault(role, {"score": 0, "spoofs": 0})
+            self.terrain[role]["spoofs"] += 1
+            self.attacks.append((round(self.elapsed, 1), role, None, kind))
+            del self.attacks[-20:]
+            self.note(f"{RED}{role}{RESET} {BOLD}{kind}{RESET}", "attack")
+        elif kind == "terrain_hit" and role:
+            self.note(f"{GREY}{role}: terrain hit ({event.get('endpoint')}){RESET}",
+                      "terrain")
         elif kind == "pass" and role:
             self.agent(role)["passes"] += 1
             self.note(f"{GREY}{role} passes{RESET}")
@@ -167,6 +202,13 @@ class MatchState:
                 if info.get("commands_run") is not None:
                     agent["commands"] = max(agent["commands"], info["commands_run"])
                 agent["stop_reason"] = info.get("stop_reason") or agent["stop_reason"]
+                tc = info.get("terrain")
+                if isinstance(tc, dict):
+                    self.terrain.setdefault(name, {"score": 0, "spoofs": 0})
+                    self.terrain[name]["score"] = tc.get("score", 0)
+                    self.terrain[name]["spoofs"] = tc.get("spoofs", 0)
+                if isinstance(info.get("health"), dict):
+                    agent["health"] = info["health"]
             for name, left in (event.get("banks") or {}).items():
                 if left is not None:
                     self.agent(name)["bank"] = left
@@ -216,7 +258,7 @@ def render(state):
             out.append(f"   {GREY}$ {agent['last'][:width - 8]}{RESET}" + CLEAR_LINE)
 
     out.append(GREY + "─" * min(width, 96) + RESET + CLEAR_LINE)
-    for when, line in state.feed[-FEED_LINES:]:
+    for when, line, cls in state.feed[-FEED_LINES:]:
         stamp = f"{GREY}{when:>6.1f}s{RESET} "
         out.append(" " + stamp + line[:width + 30] + CLEAR_LINE)
     out.extend([CLEAR_LINE] * max(0, FEED_LINES - len(state.feed[-FEED_LINES:])))
@@ -247,7 +289,7 @@ def follow(path, state, interactive):
         if interactive:
             render(state)
         elif fresh:
-            for when, line in state.feed[-FEED_LINES:]:
+            for when, line, cls in state.feed[-FEED_LINES:]:
                 print(f"{when:>7.1f}s {line}")
             state.feed.clear()
         if state.finished:
@@ -277,7 +319,7 @@ def replay(path, state, interactive, speed):
         if interactive:
             render(state)
         else:
-            for when, line in state.feed[-1:]:
+            for when, line, cls in state.feed[-1:]:
                 print(f"{when:>7.1f}s {line}")
             state.feed.clear()
 
